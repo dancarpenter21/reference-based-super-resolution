@@ -1,0 +1,24 @@
+#root {
+  max-width: 1280px;
+  margin: 0 auto;
+  padding: 2rem;
+  text-align: center;
+}
+
+.card {
+  padding: 2em;
+  display: flex;
+  flex-direction: column;
+  gap: 1em;
+  align-items: center;
+}
+
+.status {
+  font-weight: bold;
+  margin-top: 1em;
+}
+
+.path {
+  font-family: monospace;
+  color: #666;
+}
