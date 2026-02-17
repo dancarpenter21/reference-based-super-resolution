@@ -38,18 +38,23 @@ This system uses a reference-based super-resolution approach. It consists of:
 
 ## Installation & Running
 
-### 1. Backend
+### Option A: Using Docker (Recommended)
 
-You can run the backend using Docker or directly with Python.
-
-#### Option A: Using Docker (Recommended)
-This will start the backend service on port 8000.
+Run the entire application (Frontend + Backend) with a single command:
 
 ```bash
-docker-compose up --build
+docker compose up --build
 ```
 
-#### Option B: Running Locally
+- **Frontend**: `http://localhost:5173`
+- **Backend API**: `http://localhost:8000`
+- **API Docs**: `http://localhost:8000/docs`
+
+### Option B: Running Locally
+
+If you prefer to run services individually without Docker:
+
+#### 1. Backend
 
 1. Navigate to the backend directory:
    ```bash
@@ -71,11 +76,8 @@ docker-compose up --build
    ```bash
    uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
    ```
-   The API will be available at `http://localhost:8000`. API docs can be found at `http://localhost:8000/docs`.
 
-### 2. Frontend
-
-The frontend is built with React and Vite.
+#### 2. Frontend
 
 1. Navigate to the frontend directory:
    ```bash
@@ -91,7 +93,6 @@ The frontend is built with React and Vite.
    ```bash
    npm run dev
    ```
-   The frontend will be available at `http://localhost:5173`.
 
 ## Data Preparation
 
