@@ -4,6 +4,11 @@ import uuid
 from pathlib import Path
 from fastapi import UploadFile
 
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 # Define project root relative to this file
 # absolute path of this file is backend/app/services/video_processor.py
@@ -33,8 +38,8 @@ class VideoProcessor:
         return str(file_path)
 
     @staticmethod
-    def extract_frames(video_path: str, fps: int = 1) -> str:
-        """Extracts frames from the video at the given fps."""
+    def extract_frames(video_path: str) -> str:
+        """Extracts all frames from the video."""
         video_name = Path(video_path).stem
         output_dir = PROCESSED_DIR / video_name
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -44,9 +49,8 @@ class VideoProcessor:
             raise ValueError(f"Could not open video file: {video_path}")
 
         video_fps = cap.get(cv2.CAP_PROP_FPS)
-        frame_interval = int(video_fps / fps) if fps < video_fps else 1
+        logger.debug(f"Extracting all frames: video_fps={video_fps}")
         
-        count = 0
         frame_idx = 0
         
         while cap.isOpened():
@@ -54,12 +58,9 @@ class VideoProcessor:
             if not ret:
                 break
                 
-            if count % frame_interval == 0:
-                frame_path = output_dir / f"frame_{frame_idx:04d}.png"
-                cv2.imwrite(str(frame_path), frame)
-                frame_idx += 1
-            
-            count += 1
+            frame_path = output_dir / f"frame_{frame_idx:04d}.png"
+            cv2.imwrite(str(frame_path), frame)
+            frame_idx += 1
 
         cap.release()
         return str(output_dir)

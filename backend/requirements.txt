@@ -5,3 +5,5 @@ numpy==1.26.3
 opencv-python-headless==4.9.0.80
 torch==2.2.0
 torchvision==0.17.0
+pytest==8.0.0
+httpx==0.26.0

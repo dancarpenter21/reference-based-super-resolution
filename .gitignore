@@ -42,6 +42,7 @@ yarn-error.log*
 *.swo
 
 # Project Data (Large files)
+backend/tests/resources/videos/SS-24.mp4
 data/uploads/*
 data/processed/*
 data/results/*
