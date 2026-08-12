@@ -20,6 +20,8 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+test_resources/*
+.cache/
 
 # Node
 node_modules/
@@ -47,6 +49,9 @@ data/uploads/*
 data/processed/*
 data/results/*
 ml_engine/checkpoints/*
+data/jobs/*
+data/weights/*
+data/jobs.sqlite3*
 !data/uploads/.gitkeep
 !data/processed/.gitkeep
 !data/results/.gitkeep

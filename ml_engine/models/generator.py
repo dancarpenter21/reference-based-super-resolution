@@ -1,121 +1,104 @@
+from __future__ import annotations
+
+from pathlib import Path
+
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
+from torch import nn
+from torch.nn import functional as F
 
-class RefUNet(nn.Module):
-    def __init__(self, in_channels=3, out_channels=3, base_channels=64):
-        super(RefUNet, self).__init__()
 
-        # Encoder for LR Image
-        self.enc1 = self._block(in_channels, base_channels)
-        self.enc2 = self._block(base_channels, base_channels * 2)
-        
-        # Encoder for Reference Image
-        self.ref_enc1 = self._block(in_channels, base_channels)
-        self.ref_enc2 = self._block(base_channels, base_channels * 2)
+def pixel_unshuffle(x: torch.Tensor, scale: int) -> torch.Tensor:
+    b, c, h, w = x.shape
+    if h % scale or w % scale:
+        pad_h = (-h) % scale
+        pad_w = (-w) % scale
+        x = F.pad(x, (0, pad_w, 0, pad_h), mode="reflect")
+        h, w = x.shape[-2:]
+    return x.view(b, c, h // scale, scale, w // scale, scale).permute(0, 1, 3, 5, 2, 4).reshape(
+        b, c * scale * scale, h // scale, w // scale
+    )
 
-        # Fusion Layer
-        self.fusion = nn.Conv2d(base_channels * 4, base_channels * 2, kernel_size=1)
 
-        # Decoder / Upsampler
-        self.up1 = nn.ConvTranspose2d(base_channels * 2, base_channels, kernel_size=4, stride=2, padding=1)
-        self.dec1 = self._block(base_channels * 2, base_channels) # + skip connection from enc1
-        
-        self.up2 = nn.ConvTranspose2d(base_channels, base_channels, kernel_size=4, stride=2, padding=1) # Upscale 2x
-        self.final = nn.Conv2d(base_channels, out_channels, kernel_size=3, padding=1)
-        
-        # Additional Upscaling (assuming 4x total upscaling needed)
-        # The UNet structure above does 2x upsampling if input is smaller.
-        # But here, we want: Input LR -> Output HR (4x bigger)
-        # Standard UNet keeps size same or downscales/upscales back to original.
-        # We need an "Upscaling" network.
-        
-        # Let's redesign:
-        # 1. Feature Exitrain LR
-        # 2. Feature Extrain Ref
-        # 3. Concatenate
-        # 4. Residual Blocks
-        # 5. Upscale
-        
-        self.upscale_factor = 4
-        
-        # Re-defining layers for ResNet approach
-        self.feature_extractor = nn.Sequential(
-            nn.Conv2d(in_channels, base_channels, 3, 1, 1),
-            nn.ReLU(inplace=True)
-        )
-        
-        self.ref_feature_extractor = nn.Sequential(
-            nn.Conv2d(in_channels, base_channels, 3, 1, 1),
-            nn.ReLU(inplace=True)
-        )
-        
-        self.fusion_conv = nn.Conv2d(base_channels * 2, base_channels, 1)
-        
-        self.res_blocks = nn.Sequential(
-            *[ResBlock(base_channels) for _ in range(8)]
-        )
-        
-        self.upsampler = nn.Sequential(
-            nn.Conv2d(base_channels, base_channels * 4, 3, 1, 1),
-            nn.PixelShuffle(2),
-            nn.Conv2d(base_channels, base_channels * 4, 3, 1, 1),
-            nn.PixelShuffle(2),
-            nn.Conv2d(base_channels, out_channels, 3, 1, 1)
-        )
+class ResidualDenseBlock(nn.Module):
+    def __init__(self, channels: int = 64, growth: int = 32):
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, growth, 3, 1, 1)
+        self.conv2 = nn.Conv2d(channels + growth, growth, 3, 1, 1)
+        self.conv3 = nn.Conv2d(channels + growth * 2, growth, 3, 1, 1)
+        self.conv4 = nn.Conv2d(channels + growth * 3, growth, 3, 1, 1)
+        self.conv5 = nn.Conv2d(channels + growth * 4, channels, 3, 1, 1)
+        self.act = nn.LeakyReLU(0.2, inplace=True)
 
-    def _block(self, in_c, out_c):
-        return nn.Sequential(
-            nn.Conv2d(in_c, out_c, 3, 1, 1),
-            nn.InstanceNorm2d(out_c),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_c, out_c, 3, 1, 1),
-            nn.InstanceNorm2d(out_c),
-            nn.ReLU(inplace=True)
-        )
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x1 = self.act(self.conv1(x))
+        x2 = self.act(self.conv2(torch.cat((x, x1), 1)))
+        x3 = self.act(self.conv3(torch.cat((x, x1, x2), 1)))
+        x4 = self.act(self.conv4(torch.cat((x, x1, x2, x3), 1)))
+        x5 = self.conv5(torch.cat((x, x1, x2, x3, x4), 1))
+        return x5 * 0.2 + x
 
-    def forward(self, lr, ref):
-        # Extract features
-        lr_feat = self.feature_extractor(lr)
-        ref_feat = self.ref_feature_extractor(ref)
-        
-        # Simple Fusion (Concat)
-        # Note: Ref should ideally be aligned. Here we assume naive fusion for baseline.
-        # Ensure Ref features are same size as LR features?
-        # If Ref is HR, we need to downscale it to match LR feature size?
-        # Or we act on LR size.
-        
-        # Assuming Ref is passed as "already aligned to LR" or global context.
-        # If Ref is input as HR image (4x larger), we must downscale it or process it.
-        # Let's assume Ref is downscaled to LR size for feature extraction simplicity 
-        # OR we use a stride in ref_feature_extractor.
-        
-        if ref.shape[2:] != lr.shape[2:]:
-            ref = F.interpolate(ref, size=lr.shape[2:], mode='bilinear', align_corners=False)
-            
-        ref_feat = self.ref_feature_extractor(ref)
-        
-        fused = torch.cat([lr_feat, ref_feat], dim=1)
-        fused = self.fusion_conv(fused)
-        
-        res = self.res_blocks(fused)
-        res = res + lr_feat # Global Residual
-        
-        out = self.upsampler(res)
-        return out
 
-class ResBlock(nn.Module):
-    def __init__(self, channels):
-        super(ResBlock, self).__init__()
-        self.conv1 = nn.Conv2d(channels, channels, 3, 1, 1)
-        self.bn1 = nn.InstanceNorm2d(channels)
-        self.conv2 = nn.Conv2d(channels, channels, 3, 1, 1)
-        self.bn2 = nn.InstanceNorm2d(channels)
-        self.relu = nn.ReLU(inplace=True)
+class RRDB(nn.Module):
+    def __init__(self, channels: int = 64, growth: int = 32):
+        super().__init__()
+        self.rdb1 = ResidualDenseBlock(channels, growth)
+        self.rdb2 = ResidualDenseBlock(channels, growth)
+        self.rdb3 = ResidualDenseBlock(channels, growth)
 
-    def forward(self, x):
-        residual = x
-        out = self.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        out += residual
-        return out
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.rdb3(self.rdb2(self.rdb1(x))) * 0.2 + x
+
+
+class RRDBNet(nn.Module):
+    """BasicSR-compatible RealESRGAN RRDBNet for native 2x inference."""
+
+    def __init__(self, blocks: int = 23, channels: int = 64, growth: int = 32):
+        super().__init__()
+        self.scale = 2
+        self.conv_first = nn.Conv2d(12, channels, 3, 1, 1)
+        self.body = nn.Sequential(*[RRDB(channels, growth) for _ in range(blocks)])
+        self.conv_body = nn.Conv2d(channels, channels, 3, 1, 1)
+        self.conv_up1 = nn.Conv2d(channels, channels, 3, 1, 1)
+        self.conv_up2 = nn.Conv2d(channels, channels, 3, 1, 1)
+        self.conv_hr = nn.Conv2d(channels, channels, 3, 1, 1)
+        self.conv_last = nn.Conv2d(channels, 3, 3, 1, 1)
+        self.act = nn.LeakyReLU(0.2, inplace=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        original_size = x.shape[-2:]
+        feat = self.conv_first(pixel_unshuffle(x, 2))
+        body = self.conv_body(self.body(feat)) + feat
+        body = self.act(self.conv_up1(F.interpolate(body, scale_factor=2, mode="nearest")))
+        body = self.act(self.conv_up2(F.interpolate(body, scale_factor=2, mode="nearest")))
+        out = self.conv_last(self.act(self.conv_hr(body)))
+        return out[..., : original_size[0] * 2, : original_size[1] * 2]
+
+
+class CompactRRDBNet(RRDBNet):
+    """Small test fixture; production uses the 23-block network."""
+
+    def __init__(self):
+        super().__init__(blocks=2, channels=16, growth=8)
+
+
+def unwrap_checkpoint(value: dict) -> dict:
+    for key in ("params_ema", "params", "state_dict"):
+        if key in value:
+            value = value[key]
+    return {key.removeprefix("module."): tensor for key, tensor in value.items()}
+
+
+def load_weights(model: nn.Module, path: str | Path, strict: bool = True) -> None:
+    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+    model.load_state_dict(unwrap_checkpoint(checkpoint), strict=strict)
+
+
+def output_4_by_3(model: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    native = model(x)
+    return F.interpolate(
+        native,
+        size=(round(x.shape[-2] * 4 / 3), round(x.shape[-1] * 4 / 3)),
+        mode="bicubic",
+        align_corners=False,
+        antialias=True,
+    ).clamp(0, 1)

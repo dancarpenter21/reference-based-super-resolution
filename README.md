@@ -1,104 +1,84 @@
 # Reference-Based Super-Resolution
 
-The use case for this web app is when the user has a copmlete low-resolution video of a scene, and a high-resolution video of the same scene that is missing frames, and wants to use the high-resolution video to train a model to upscale the complete low-resolution video.
+A local, single-GPU application that learns a conservative video upscaler from an incomplete higher-quality reference and applies it to every frame of a complete lower-quality video.
 
-## The Problem
+The application first tries to prove that the reference overlaps the complete source. If it cannot establish enough geometrically consistent matches, it reports that result and safely falls back to unpaired adaptation: high-quality reference frames provide the targets, while blur, noise, and compression are calibrated from the complete source. It never silently treats unrelated frames as ground truth.
 
-Two videos of the same scene are provided, one low-resolution and one high-resolution. The high resolution video is missing frames, typically in segments a couple seconds long at a time. The low-resoution video is complete, but obviously low-resolution. The goal is to train a model to upscale the low-resolution video to high-resolution, using the high-resolution video as a reference so that the upscaled video is the same resolution as the high-resolution reference video, but has all the frames that the low-resolution video has.
+## Current workflow
 
-## The Solution
+1. Upload the complete low-resolution video and the incomplete high-resolution reference.
+2. Probe both streams and search for reliable overlapping spans.
+3. Fine-tune a pretrained RealESRGAN ×2 RRDB model without a GAN discriminator.
+4. Upscale the complete stream to 640×480 (4:3), stabilize residual detail across frames, and restore the original audio.
+5. Preview/download the MP4 and its JSON processing report.
 
-This system uses a reference-based super-resolution approach. It consists of:
-- **Backend**: A FastAPI application that handles video processing and model inference.
-- **Frontend**: A React application for user interaction (uploading videos, viewing results).
-- **ML Engine**: The core machine learning logic for training and inference.
+The supplied fixtures exercise the fallback path: `ss-24-hi.mp4` is 720×480 at 24 fps with non-square pixels, while `ss-24-low.mp4` is 480×360 at 29.97 fps. Coarse visual and audio inspection did not establish a shared timeline.
 
-## Project Structure
+## ROCm setup (RX 9070 XT / WSL2)
 
-```
-.
-├── backend/            # FastAPI backend
-│   ├── app/            # Application logic
-│   ├── Dockerfile      # Backend container definition
-│   └── requirements.txt
-├── frontend/           # React frontend
-│   ├── src/
-│   └── package.json
-├── ml_engine/          # Machine Learning models and training scripts
-├── data/               # Data directory
-├── scripts/            # Utility scripts
-└── docker-compose.yml  # Docker composition for backend service
-```
+Requirements:
 
-## Prerequisites
+- Ubuntu 24.04 under WSL2
+- ROCm 7.2 with `/dev/dxg` available
+- AMD Radeon RX 9070 XT (`gfx1201`)
+- Python 3.12, `uv`, Node.js 22, and `curl`
 
-- **Docker & Docker Compose** (Recommended for backend)
-- **Python 3.10+** (If running backend locally)
-- **Node.js 18+** (For frontend)
-
-## Installation & Running
-
-### Option A: Using Docker (Recommended)
-
-Run the entire application (Frontend + Backend) with a single command:
+Install AMD's supported PyTorch 2.9.1 wheels and the project environment:
 
 ```bash
-docker compose up --build
+chmod +x scripts/install_rocm.sh
+./scripts/install_rocm.sh
 ```
 
-- **Frontend**: `http://localhost:5173`
-- **Backend API**: `http://localhost:8000`
-- **API Docs**: `http://localhost:8000/docs`
+The script creates `.venv`, installs the ROCm 7.2 wheels published by AMD, applies AMD's required WSL runtime-library adjustment, and runs a GPU check. Validate again at any time with:
 
-### Option B: Running Locally
+```bash
+.venv/bin/python -m ml_engine.cli gpu-check
+```
 
-If you prefer to run services individually without Docker:
+## Run the application
 
-#### 1. Backend
+Backend (from the repository root):
 
-1. Navigate to the backend directory:
-   ```bash
-   cd backend
-   ```
+```bash
+.venv/bin/uvicorn app.main:app --app-dir backend --host 0.0.0.0 --port 8000
+```
 
-2. Create a virtual environment (optional but recommended):
-   ```bash
-   python -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
-   ```
+Frontend:
 
-3. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
+```bash
+cd frontend
+npm install
+npm run dev
+```
 
-4. Start the server:
-   ```bash
-   uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
-   ```
+Open `http://localhost:5173`. Jobs and generated artifacts live under `data/jobs/`; metadata lives in `data/jobs.sqlite3`. One durable worker consumes GPU jobs serially. Interrupted non-terminal jobs return to the queue when the backend restarts.
 
-#### 2. Frontend
+## CLI and diagnostics
 
-1. Navigate to the frontend directory:
-   ```bash
-   cd frontend
-   ```
+Inspect media and alignment without training:
 
-2. Install dependencies:
-   ```bash
-   npm install
-   ```
+```bash
+.venv/bin/python -m ml_engine.cli inspect test_resources/ss-24-low.mp4 test_resources/ss-24-hi.mp4
+```
 
-3. Start the development server:
-   ```bash
-   npm run dev
-   ```
+Run an end-to-end job without the web UI:
 
-## Data Preparation
+```bash
+.venv/bin/python -m ml_engine.cli run \
+  test_resources/ss-24-low.mp4 test_resources/ss-24-hi.mp4 \
+  --preset balanced --output-dir data/cli-job
+```
 
-For training or testing, you may need to prepare your video data.
+Presets cap fine-tuning at approximately 15 minutes (`quick`), 1 hour (`balanced`), or 4 hours (`quality`). Full-video inference takes additional time.
 
-- **Extract Frames**: Use the `scripts/prepare_data.py` script to extract frames from a video file.
-  ```bash
-  python scripts/prepare_data.py /path/to/your/video.mp4
-  ```
+## Tests
+
+```bash
+.venv/bin/pytest
+cd frontend && npm test -- --run
+```
+
+CPU tests cover media geometry, conservative alignment fallback, job persistence, APIs, and model dimensions. The ROCm check is intentionally separate so an environment problem cannot masquerade as an ML test failure.
+
+The model implementation is compatible with the BSD-licensed Real-ESRGAN release weights and follows the Apache-licensed BasicSR RRDB layout. The pretrained asset is downloaded from the official v0.2.1 release and verified by SHA-256.

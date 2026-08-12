@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 
+
 def create_dummy_video(filename, duration=2, fps=30):
     height, width = 480, 640
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
