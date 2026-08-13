@@ -68,7 +68,7 @@ class JobStore:
         timestamp = now()
         self.connection().execute(
             "INSERT INTO jobs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (job_id, "queued", "queued", 0.0, "Waiting for GPU worker", preset, low_path,
+            (job_id, "queued", "queued", 0.0, "Queued for processing", preset, low_path,
              reference_path, job_dir, None, None, None, 0, timestamp, timestamp),
         )
         self.connection().commit()
@@ -85,16 +85,42 @@ class JobStore:
         row = self.connection().execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
         if row is None:
             raise KeyError(job_id)
+        return self._deserialize(row)
+
+    @staticmethod
+    def _deserialize(row: sqlite3.Row) -> dict:
         value = dict(row)
         value["cancel_requested"] = bool(value["cancel_requested"])
         value["metrics"] = json.loads(value["metrics"]) if value["metrics"] else None
         return value
+
+    def list_all(self) -> list[dict]:
+        rows = self.connection().execute(
+            """
+            SELECT * FROM jobs
+            ORDER BY
+              CASE WHEN state IN ('completed','failed','cancelled') THEN 1 ELSE 0 END,
+              CASE WHEN state NOT IN ('completed','failed','cancelled') THEN created_at END ASC,
+              CASE WHEN state IN ('completed','failed','cancelled') THEN created_at END DESC,
+              id ASC
+            """
+        ).fetchall()
+        return [self._deserialize(row) for row in rows]
 
     def next_queued(self) -> dict | None:
         row = self.connection().execute(
             "SELECT id FROM jobs WHERE state='queued' ORDER BY created_at LIMIT 1"
         ).fetchone()
         return self.get(row["id"]) if row else None
+
+    def active_counts(self) -> dict[str, int]:
+        rows = self.connection().execute(
+            "SELECT state, COUNT(*) count FROM jobs "
+            "WHERE state NOT IN ('completed','failed','cancelled') GROUP BY state"
+        ).fetchall()
+        queued = sum(row["count"] for row in rows if row["state"] == "queued")
+        processing = sum(row["count"] for row in rows if row["state"] != "queued")
+        return {"queued": queued, "processing": processing, "outstanding": queued + processing}
 
     def update(self, job_id: str, **fields) -> dict:
         allowed = {"state", "stage", "progress", "message", "metrics", "warning", "error", "cancel_requested"}
@@ -114,6 +140,27 @@ class JobStore:
         if job["state"] == "queued":
             return self.update(job_id, state="cancelled", stage="cancelled", message="Job cancelled", progress=job["progress"])
         return self.update(job_id, cancel_requested=1, message="Cancellation requested")
+
+    def cancel_all(self) -> tuple[int, list[dict]]:
+        db = self.connection()
+        timestamp = now()
+        with db:
+            queued = db.execute("SELECT id FROM jobs WHERE state='queued'").fetchall()
+            running = db.execute(
+                "SELECT id FROM jobs WHERE state NOT IN ('queued','completed','failed','cancelled') "
+                "AND cancel_requested=0"
+            ).fetchall()
+            db.execute(
+                "UPDATE jobs SET state='cancelled', stage='cancelled', message='Job cancelled', "
+                "updated_at=? WHERE state='queued'",
+                (timestamp,),
+            )
+            db.execute(
+                "UPDATE jobs SET cancel_requested=1, message='Cancellation requested', updated_at=? "
+                "WHERE state NOT IN ('queued','completed','failed','cancelled') AND cancel_requested=0",
+                (timestamp,),
+            )
+        return len(queued) + len(running), self.list_all()
 
     def delete(self, job_id: str) -> dict:
         job = self.get(job_id)

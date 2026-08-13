@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from datetime import UTC, datetime
 
 from ml_engine.pipeline import Cancelled, run_pipeline
 
@@ -16,11 +17,19 @@ class JobWorker:
         self.stop_event = threading.Event()
         self.wake_event = threading.Event()
         self.thread: threading.Thread | None = None
+        self.started_at: str | None = None
+        self.current_job_id: str | None = None
+        self.fatal_error: str | None = None
+        self._status_lock = threading.Lock()
 
     def start(self) -> None:
         if self.thread and self.thread.is_alive():
             return
         self.stop_event.clear()
+        with self._status_lock:
+            self.started_at = datetime.now(UTC).isoformat()
+            self.current_job_id = None
+            self.fatal_error = None
         self.thread = threading.Thread(target=self._loop, name="refsr-gpu-worker", daemon=True)
         self.thread.start()
 
@@ -33,14 +42,36 @@ class JobWorker:
     def notify(self) -> None:
         self.wake_event.set()
 
+    def status(self) -> dict:
+        alive = bool(self.thread and self.thread.is_alive())
+        with self._status_lock:
+            current_job_id = self.current_job_id
+            return {
+                "state": "busy" if alive and current_job_id else "idle" if alive else "stopped",
+                "current_job_id": current_job_id,
+                "started_at": self.started_at,
+                "fatal_error": self.fatal_error,
+            }
+
     def _loop(self) -> None:
-        while not self.stop_event.is_set():
-            job = self.jobs.next_queued()
-            if job is None:
-                self.wake_event.wait(2)
-                self.wake_event.clear()
-                continue
-            self._run(job)
+        try:
+            while not self.stop_event.is_set():
+                job = self.jobs.next_queued()
+                if job is None:
+                    self.wake_event.wait(2)
+                    self.wake_event.clear()
+                    continue
+                with self._status_lock:
+                    self.current_job_id = job["id"]
+                try:
+                    self._run(job)
+                finally:
+                    with self._status_lock:
+                        self.current_job_id = None
+        except Exception as error:
+            logger.exception("GPU worker stopped unexpectedly")
+            with self._status_lock:
+                self.fatal_error = f"{type(error).__name__}: {error}"
 
     def _run(self, job: dict) -> None:
         job_id = job["id"]

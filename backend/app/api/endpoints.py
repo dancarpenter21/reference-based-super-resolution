@@ -9,6 +9,7 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
 from app.services.job_store import store
+from app.services.gpu_diagnostics import gpu_diagnostics
 from app.services.job_worker import worker
 from ml_engine.config import PRESETS
 
@@ -69,6 +70,33 @@ async def create_job(
         raise
     worker.notify()
     return public_job(job)
+
+
+@router.get("/jobs")
+def list_jobs():
+    return {"jobs": [public_job(job) for job in store.list_all()]}
+
+
+@router.post("/jobs/cancel-all")
+def cancel_all_jobs():
+    affected, jobs = store.cancel_all()
+    return {"affected": affected, "jobs": [public_job(job) for job in jobs]}
+
+
+@router.get("/system/status")
+def system_status():
+    return {
+        "backend": {"state": "online"},
+        "worker": worker.status(),
+        "gpu": gpu_diagnostics.status(),
+        "queue": store.active_counts(),
+    }
+
+
+@router.post("/system/gpu/recheck", status_code=202)
+def recheck_gpu():
+    gpu_diagnostics.start_check()
+    return gpu_diagnostics.status()
 
 
 @router.get("/jobs/{job_id}")

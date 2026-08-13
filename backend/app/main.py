@@ -6,12 +6,14 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api import endpoints
+from app.services.gpu_diagnostics import gpu_diagnostics
 from app.services.job_worker import worker
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     worker.start()
+    gpu_diagnostics.start_check()
     yield
     worker.stop()
 
