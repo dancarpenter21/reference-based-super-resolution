@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 
 from ml_engine.media import (
+    audio_fingerprints,
     MediaError,
     MediaInfo,
     normalize_reference_frame,
@@ -28,6 +29,7 @@ def test_probe_and_validate(tmp_path):
     assert (info.width, info.height, info.frame_count) == (80, 60, 12)
     assert info.fps == pytest.approx(12, abs=0.1)
     validate_input(info)
+    assert audio_fingerprints(path).shape == (0, 128)
 
 
 def test_reference_normalization_corrects_geometry():

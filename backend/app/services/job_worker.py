@@ -4,7 +4,7 @@ import logging
 import threading
 from datetime import UTC, datetime
 
-from ml_engine.pipeline import Cancelled, run_pipeline
+from ml_engine.pipeline import Cancelled, analyze_pipeline, process_pipeline
 
 from .job_store import JobStore, store
 
@@ -78,7 +78,18 @@ class JobWorker:
         if job["cancel_requested"]:
             self.jobs.update(job_id, state="cancelled", stage="cancelled", message="Job cancelled")
             return
-        self.jobs.update(job_id, state="analyzing", stage="analyzing", progress=0.01, message="Starting analysis")
+        phase = job.get("phase", "analysis")
+        first_state = "analyzing" if phase == "analysis" else "training"
+        processing_message = (
+            "Starting reference-only processing"
+            if job.get("matching_mode") == "reference_only"
+            else "Starting approved processing"
+        )
+        self.jobs.update(
+            job_id, state=first_state, stage=first_state,
+            progress=0.01 if phase == "analysis" else max(0.07, job["progress"]),
+            message="Starting analysis" if phase == "analysis" else processing_message,
+        )
 
         def cancelled() -> bool:
             return self.stop_event.is_set() or self.jobs.get(job_id)["cancel_requested"]
@@ -93,8 +104,21 @@ class JobWorker:
             self.jobs.update(job_id, **fields)
 
         try:
-            run_pipeline(
-                job["low_path"], job["reference_path"], job["job_dir"], job["preset"], update, cancelled
+            if phase == "analysis":
+                review = analyze_pipeline(
+                    job["low_path"], job["reference_path"], job["job_dir"], update, cancelled
+                )
+                self.jobs.update(
+                    job_id, state="awaiting_match_review", stage="awaiting_match_review", progress=0.07,
+                    message="Review proposed frame matches", review_data=review,
+                    review_revision=int(review.get("revision", 1)), phase="review",
+                    warning=review.get("summary", {}).get("warning"),
+                )
+                return
+            current = self.jobs.get(job_id)
+            process_pipeline(
+                job["low_path"], job["reference_path"], job["job_dir"], job["preset"],
+                current["review_data"] or {}, update, cancelled,
             )
             self.jobs.update(
                 job_id, state="completed", stage="completed", progress=1.0,

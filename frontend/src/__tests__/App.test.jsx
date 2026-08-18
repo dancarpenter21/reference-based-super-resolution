@@ -44,7 +44,8 @@ describe('App', () => {
     render(<App />)
     expect(screen.getByText('01 · Complete source')).toBeInTheDocument()
     expect(screen.getByText('02 · Detail reference')).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /analyze and upscale/i })).toBeInTheDocument()
+    expect(screen.getByRole('radio', { name: /find and match shared frames/i })).toBeChecked()
+    expect(screen.getByRole('button', { name: /analyze frames/i })).toBeInTheDocument()
     expect(await screen.findByText(/No jobs yet/)).toBeInTheDocument()
   })
 
@@ -64,6 +65,27 @@ describe('App', () => {
     expect(screen.getByText('Processing job active-j')).toBeInTheDocument()
     expect(screen.getByText('AMD Radeon RX 9070 XT')).toBeInTheDocument()
     expect(window.localStorage.getItem('refsr-selected-job')).toBe(activeJob.id)
+  })
+
+  it('submits reference-only mode without frame analysis', async () => {
+    const queued = {
+      ...activeJob, id: 'reference-only', state: 'queued', stage: 'queued', progress: 0,
+      message: 'Queued for reference-only processing', matching_mode: 'reference_only',
+    }
+    axios.post.mockResolvedValue({ data: queued })
+    const { container } = render(<App />)
+    const [lowInput, referenceInput] = container.querySelectorAll('input[type="file"]')
+    fireEvent.change(lowInput, { target: { files: [new File(['low'], 'low.mp4', { type: 'video/mp4' })] } })
+    fireEvent.change(referenceInput, { target: { files: [new File(['reference'], 'reference.mp4', { type: 'video/mp4' })] } })
+    fireEvent.click(screen.getByRole('radio', { name: /skip matching/i }))
+
+    expect(screen.getByRole('button', { name: /start reference-only processing/i })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /start reference-only processing/i }))
+
+    await waitFor(() => expect(axios.post).toHaveBeenCalled())
+    const [, data] = axios.post.mock.calls[0]
+    expect(data.get('matching_mode')).toBe('reference_only')
+    expect(data.get('preset')).toBe('balanced')
   })
 
   it('restores the selected historical job from local storage', async () => {
@@ -130,5 +152,47 @@ describe('App', () => {
 
     await waitFor(() => expect(axios.post).toHaveBeenCalledWith(expect.stringMatching(/system\/gpu\/recheck$/)))
     expect(screen.getByText('Checking availability')).toBeInTheDocument()
+  })
+
+  it('requires boundary review before processing a proposed segment', async () => {
+    const reviewJob = {
+      ...activeJob, state: 'awaiting_match_review', stage: 'awaiting_match_review', progress: .07,
+      message: 'Review proposed frame matches', needs_review: true,
+    }
+    const segment = {
+      id: 'segment-1', confidence: .9, origin: 'automatic', status: 'proposed',
+      low_start: { frame_index: 10, pts: 10, time_seconds: 1 },
+      low_end: { frame_index: 50, pts: 50, time_seconds: 5 },
+      reference_start: { frame_index: 8, pts: 8, time_seconds: 1 },
+      reference_end: { frame_index: 40, pts: 40, time_seconds: 5 },
+    }
+    const review = {
+      revision: 1, segments: [segment], summary: { proposed_segments: 1, matched_seconds: 4 },
+      media: {
+        low: { fps: 10, frame_count: 100, duration: 10 },
+        reference: { fps: 8, frame_count: 80, duration: 10 },
+      },
+      proxy_urls: { low: '/api/v1/jobs/review/navigation/low', reference: '/api/v1/jobs/review/navigation/reference' },
+    }
+    axios.get.mockImplementation((url) => {
+      if (url.endsWith('/system/status')) return Promise.resolve({ data: systemStatus })
+      if (url.endsWith('/match-review')) return Promise.resolve({ data: review })
+      return Promise.resolve({ data: { jobs: [reviewJob] } })
+    })
+    axios.put.mockResolvedValue({ data: {
+      ...review, revision: 2, segments: [{ ...segment, status: 'confirmed' }],
+      summary: { confirmed_segments: 1, proposed_segments: 0, matched_seconds: 4 },
+    } })
+
+    render(<App />)
+
+    expect(await screen.findByText('Start frames')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /approve matches/i })).toBeDisabled()
+    fireEvent.click(screen.getByRole('button', { name: /confirm boundaries/i }))
+
+    await waitFor(() => expect(axios.put).toHaveBeenCalledWith(
+      expect.stringMatching(/match-review$/), expect.objectContaining({ revision: 1 }),
+    ))
+    expect(await screen.findByRole('button', { name: /approve matches/i })).toBeEnabled()
   })
 })

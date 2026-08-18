@@ -1,5 +1,7 @@
 import time
 
+from app.services import job_worker as job_worker_module
+from app.services.job_store import JobStore
 from app.services.job_worker import JobWorker
 
 
@@ -38,3 +40,42 @@ def test_worker_reports_fatal_loop_error():
     status = worker.status()
     assert status["state"] == "stopped"
     assert status["fatal_error"] == "RuntimeError: database unavailable"
+
+
+def test_worker_pauses_for_review_then_dispatches_approved_processing(tmp_path, monkeypatch):
+    jobs = JobStore(tmp_path / "jobs.sqlite3")
+    job = jobs.create("low.mp4", "reference.mp4", str(tmp_path / "job"), "quick")
+    review = {"revision": 1, "segments": [], "summary": {"proposed_segments": 0}}
+    monkeypatch.setattr(job_worker_module, "analyze_pipeline", lambda *args, **kwargs: review)
+    processed = []
+    monkeypatch.setattr(job_worker_module, "process_pipeline", lambda *args, **kwargs: processed.append(args))
+    worker = JobWorker(jobs)
+
+    worker._run(job)
+    waiting = jobs.get(job["id"])
+
+    assert waiting["state"] == "awaiting_match_review"
+    assert waiting["phase"] == "review"
+    approved = jobs.approve_review(job["id"], "unpaired", 1)
+    worker._run(approved)
+    assert processed
+    assert jobs.get(job["id"])["state"] == "completed"
+
+
+def test_reference_only_worker_never_runs_match_analysis(tmp_path, monkeypatch):
+    jobs = JobStore(tmp_path / "jobs.sqlite3")
+    job = jobs.create(
+        "low.mp4", "reference.mp4", str(tmp_path / "job"), "quick",
+        matching_mode="reference_only",
+    )
+    monkeypatch.setattr(
+        job_worker_module, "analyze_pipeline",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("analysis should be skipped")),
+    )
+    processed = []
+    monkeypatch.setattr(job_worker_module, "process_pipeline", lambda *args, **kwargs: processed.append(args))
+
+    JobWorker(jobs)._run(job)
+
+    assert processed
+    assert jobs.get(job["id"])["state"] == "completed"

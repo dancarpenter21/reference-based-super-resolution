@@ -57,7 +57,7 @@ class ReferenceVideoDataset(Dataset):
         patch_size: int = 192,
         length: int = 10_000,
         validation: bool = False,
-        paired_anchors: list[dict] | None = None,
+        paired_manifest: list[dict] | None = None,
     ):
         self.reference_path = str(reference_path)
         self.reference_info: MediaInfo = probe(reference_path)
@@ -68,7 +68,9 @@ class ReferenceVideoDataset(Dataset):
         self.frame_count = self.reference_info.frame_count
         self.low_path = str(low_path)
         self.low_info = probe(low_path)
-        self.paired_anchors = paired_anchors or []
+        self.paired_manifest = paired_manifest or []
+        self._resolved_low_indices: dict[int, int | None] = {}
+        self._segment_warps: dict[str, np.ndarray] = {}
         self.cap: cv2.VideoCapture | None = None
         self.low_cap: cv2.VideoCapture | None = None
 
@@ -98,14 +100,53 @@ class ReferenceVideoDataset(Dataset):
         # Last 10% is validation-only; adjacent timeline leakage is avoided.
         split = int(self.frame_count * 0.9)
         lo, hi = (split, self.frame_count) if self.validation else (0, max(1, split))
-        use_paired = bool(self.paired_anchors) and rng.random() < 0.5
+        use_paired = bool(self.paired_manifest) and rng.random() < 0.5
         if use_paired:
-            anchor = self.paired_anchors[index % len(self.paired_anchors)]
-            ref_index = round(anchor["reference_time"] * self.reference_info.fps)
-            low_index = round(anchor["low_time"] * self.low_info.fps)
+            pair_position = index % len(self.paired_manifest)
+            pair = self.paired_manifest[pair_position]
+            ref_index = int(pair["reference_frame"])
+            low_index = int(pair["low_frame"])
             hr = normalize_reference_frame(self._read(self._capture(), ref_index, "reference"), self.reference_info)
-            paired_lr = self._read(self._low_capture(), low_index, "low")
-            paired_lr = cv2.resize(paired_lr, (480, 360), interpolation=cv2.INTER_AREA)
+            # Different cadences can put the projected frame between two source frames.
+            # Select the closest local visual match instead of accumulating FPS drift.
+            target = cv2.resize(hr, (160, 120), interpolation=cv2.INTER_AREA).astype(np.float32)
+            resolved = self._resolved_low_indices.get(pair_position, -1)
+            best_error = 0.0
+            if resolved == -1:
+                best_error = float("inf")
+                resolved = None
+                for candidate_index in range(max(0, low_index - 2), min(self.low_info.frame_count, low_index + 3)):
+                    candidate = self._read(self._low_capture(), candidate_index, "low")
+                    candidate_small = cv2.resize(candidate, (160, 120), interpolation=cv2.INTER_AREA).astype(np.float32)
+                    error = float(np.mean(np.abs(candidate_small - target)))
+                    if error < best_error:
+                        best_error, resolved = error, candidate_index
+                if best_error > 45.0:
+                    resolved = None
+                self._resolved_low_indices[pair_position] = resolved
+            if resolved is None:
+                use_paired = False
+            else:
+                paired_lr = self._read(self._low_capture(), resolved, "low")
+                paired_lr = cv2.resize(paired_lr, (480, 360), interpolation=cv2.INTER_AREA)
+                segment_id = str(pair.get("segment_id", "default"))
+                if segment_id not in self._segment_warps:
+                    warp = np.eye(2, 3, dtype=np.float32)
+                    try:
+                        low_gray = cv2.cvtColor(cv2.resize(paired_lr, (160, 120)), cv2.COLOR_BGR2GRAY).astype(np.float32) / 255
+                        ref_gray = cv2.cvtColor(cv2.resize(hr, (160, 120)), cv2.COLOR_BGR2GRAY).astype(np.float32) / 255
+                        cv2.findTransformECC(
+                            low_gray, ref_gray, warp, cv2.MOTION_AFFINE,
+                            (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 1e-4),
+                        )
+                        warp[:, 2] *= 4.0
+                    except cv2.error:
+                        warp = np.eye(2, 3, dtype=np.float32)
+                    self._segment_warps[segment_id] = warp
+                hr = cv2.warpAffine(
+                    hr, self._segment_warps[segment_id], (640, 480),
+                    flags=cv2.INTER_LANCZOS4 | cv2.WARP_INVERSE_MAP, borderMode=cv2.BORDER_REFLECT,
+                )
         else:
             frame_index = rng.randrange(lo, max(lo + 1, hi))
             hr = normalize_reference_frame(

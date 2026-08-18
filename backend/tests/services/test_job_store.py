@@ -64,5 +64,37 @@ def test_active_counts_separate_queued_and_processing(tmp_path):
     jobs.update(running["id"], state="analyzing", stage="analyzing")
     jobs.update(completed["id"], state="completed", stage="completed")
 
-    assert jobs.active_counts() == {"queued": 1, "processing": 1, "outstanding": 2}
-    assert jobs.get(queued["id"])["message"] == "Queued for processing"
+    assert jobs.active_counts() == {"queued": 1, "processing": 1, "needs_review": 0, "outstanding": 2}
+    assert jobs.get(queued["id"])["message"] == "Queued for frame analysis"
+
+
+def test_review_is_persisted_and_does_not_consume_worker_capacity(tmp_path):
+    path = tmp_path / "jobs.sqlite3"
+    jobs = JobStore(path)
+    job = jobs.create("low.mp4", "reference.mp4", str(tmp_path / "review"), "quick")
+    review = {"revision": 1, "segments": [], "summary": {"proposed_segments": 0}}
+    jobs.update(
+        job["id"], state="awaiting_match_review", stage="awaiting_match_review",
+        phase="review", review_data=review, review_revision=1,
+    )
+
+    restored = JobStore(path).get(job["id"])
+
+    assert restored["state"] == "awaiting_match_review"
+    assert restored["review_data"] == review
+    assert jobs.active_counts() == {"queued": 0, "processing": 0, "needs_review": 1, "outstanding": 0}
+    assert jobs.cancel(job["id"])["state"] == "cancelled"
+
+
+def test_reference_only_job_skips_analysis_phase(tmp_path):
+    jobs = JobStore(tmp_path / "jobs.sqlite3")
+    job = jobs.create(
+        "low.mp4", "reference.mp4", str(tmp_path / "reference-only"), "quick",
+        matching_mode="reference_only",
+    )
+
+    assert job["matching_mode"] == "reference_only"
+    assert job["phase"] == "processing"
+    assert job["alignment_mode"] == "unpaired"
+    assert job["review_data"]["approved_mode"] == "unpaired"
+    assert job["message"] == "Queued for reference-only processing"

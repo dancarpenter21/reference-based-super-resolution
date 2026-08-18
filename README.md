@@ -2,17 +2,21 @@
 
 A local, single-GPU application that learns a conservative video upscaler from an incomplete higher-quality reference and applies it to every frame of a complete lower-quality video.
 
-The application first tries to prove that the reference overlaps the complete source. If it cannot establish enough geometrically consistent matches, it reports that result and safely falls back to unpaired adaptation: high-quality reference frames provide the targets, while blur, noise, and compression are calibrated from the complete source. It never silently treats unrelated frames as ground truth.
+The application proposes chronological overlap segments, then pauses for frame-match review before it starts GPU training. Different constant frame rates are handled with independent frame indices and per-segment timestamp mappings rather than one global offset. It never silently treats an automatic proposal as ground truth.
 
 ## Current workflow
 
 1. Upload the complete low-resolution video and the incomplete high-resolution reference.
-2. Probe both streams and search for reliable overlapping spans.
-3. Fine-tune a pretrained RealESRGAN ×2 RRDB model without a GAN discriminator.
-4. Upscale the complete stream to 640×480 (4:3), stabilize residual detail across frames, and restore the original audio.
-5. Preview/download the MP4 and its JSON processing report.
+2. Choose **Find and match shared frames** (recommended) or **Skip matching · reference only**.
+3. Guided jobs probe both streams, create lightweight navigation proxies, and propose same-order shared sections with gaps. Reference-only jobs skip this work and go directly to unpaired adaptation.
+4. For guided jobs, review every proposed section in the browser. Confirm or adjust its exact start/end frame pairs, reject it, or add a missing section from the two playheads.
+5. Fine-tune a pretrained RealESRGAN ×2 RRDB model without a GAN discriminator.
+6. Upscale the complete stream to 640×480 (4:3), stabilize residual detail across frames, and restore the original audio.
+7. Preview/download the MP4 and its JSON processing report, including the selected matching workflow.
 
-The supplied fixtures exercise the fallback path: `ss-24-hi.mp4` is 720×480 at 24 fps with non-square pixels, while `ss-24-low.mp4` is 480×360 at 29.97 fps. Coarse visual and audio inspection did not establish a shared timeline.
+Review jobs survive browser and backend restarts and do not occupy the GPU queue. The review screen provides exact ±1/±10-frame stepping, timecodes, overlay comparison, segment splitting/merging, and keyboard stepping (left/right for the complete source, down/up for the reference; hold Shift for ten frames).
+
+The supplied fixtures include 720×480 references and a 480×360, 29.97 fps complete source. The matcher treats differing frame rates, intermittent omissions, and non-square reference pixels independently; the user remains the final authority on which proposed segments are safe for paired supervision.
 
 ## ROCm setup (RX 9070 XT / WSL2)
 
@@ -79,6 +83,6 @@ Presets cap fine-tuning at approximately 15 minutes (`quick`), 1 hour (`balanced
 cd frontend && npm test -- --run
 ```
 
-CPU tests cover media geometry, conservative alignment fallback, job persistence, APIs, and model dimensions. The ROCm check is intentionally separate so an environment problem cannot masquerade as an ML test failure.
+CPU tests cover media geometry, unequal-frame-rate segment alignment, durable review state, review APIs, conservative fallback, and model dimensions. The ROCm check is intentionally separate so an environment problem cannot masquerade as an ML test failure.
 
 The model implementation is compatible with the BSD-licensed Real-ESRGAN release weights and follows the Apache-licensed BasicSR RRDB layout. The pretrained asset is downloaded from the official v0.2.1 release and verified by SHA-256.

@@ -30,6 +30,9 @@ class MediaInfo:
     has_audio: bool
     sample_aspect_ratio: str
     variable_frame_rate: bool
+    fps_numerator: int = 0
+    fps_denominator: int = 1
+    time_base: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -74,9 +77,11 @@ def probe(path: str | Path) -> MediaInfo:
     vfr = False
     if avg_match and tbr_match:
         vfr = abs(float(avg_match.group(1)) - float(tbr_match.group(1))) > 0.02
+    rate = Fraction(fps).limit_denominator(100_000)
     return MediaInfo(
         str(path.resolve()), width, height, fps, frames, frames / fps, codec,
-        has_audio, sar, vfr,
+        has_audio, sar, vfr, rate.numerator, rate.denominator,
+        f"{rate.denominator}/{rate.numerator}",
     )
 
 
@@ -127,6 +132,58 @@ def sampled_frames(path: str | Path, every_seconds: float = 1.0) -> Iterator[tup
             yield index / fps, frame
         index += 1
     cap.release()
+
+
+def read_frame(path: str | Path, frame_index: int) -> np.ndarray:
+    """Decode a specific CFR frame, seeking to its preceding keyframe internally."""
+    cap = cv2.VideoCapture(str(path))
+    cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_index))
+    ok, frame = cap.read()
+    cap.release()
+    if not ok:
+        raise MediaError(f"Could not decode frame {frame_index}")
+    return frame
+
+
+def create_navigation_proxy(input_path: str | Path, output_path: str | Path) -> None:
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        ffmpeg_executable(), "-y", "-hide_banner", "-loglevel", "error", "-i", str(input_path),
+        "-vf", "scale='min(640,iw)':-2", "-an", "-c:v", "libx264", "-preset", "veryfast",
+        "-crf", "27", "-force_key_frames", "expr:gte(t,n_forced*1)",
+        "-movflags", "+faststart", str(output_path),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if proc.returncode:
+        raise MediaError(f"Navigation proxy encode failed: {proc.stderr[-2000:]}")
+
+
+def audio_fingerprints(path: str | Path, every_seconds: float = 1.0, sample_rate: int = 8000) -> np.ndarray:
+    """Return compact, compression-tolerant audio descriptors; silence/no-audio returns no rows."""
+    cmd = [
+        ffmpeg_executable(), "-hide_banner", "-loglevel", "error", "-i", str(path),
+        "-vn", "-ac", "1", "-ar", str(sample_rate), "-f", "s16le", "pipe:1",
+    ]
+    proc = subprocess.run(cmd, capture_output=True, check=False)
+    if proc.returncode or not proc.stdout:
+        return np.empty((0, 128), dtype=np.float32)
+    audio = np.frombuffer(proc.stdout, dtype="<i2").astype(np.float32) / 32768.0
+    chunk_size = max(1, round(sample_rate * every_seconds))
+    descriptors: list[np.ndarray] = []
+    for start in range(0, len(audio) - chunk_size + 1, chunk_size):
+        chunk = audio[start:start + chunk_size]
+        if float(np.sqrt(np.mean(chunk * chunk))) < 1e-4:
+            descriptors.append(np.zeros(128, dtype=np.float32))
+            continue
+        blocks = np.array_split(np.abs(chunk), 64)
+        envelope = np.array([block.mean() for block in blocks], dtype=np.float32)
+        spectrum = np.log1p(np.abs(np.fft.rfft(chunk * np.hanning(len(chunk)))))
+        spectral_bins = np.array([block.mean() for block in np.array_split(spectrum, 64)], dtype=np.float32)
+        descriptor = np.concatenate((envelope, spectral_bins))
+        descriptor = (descriptor - descriptor.mean()) / (descriptor.std() + 1e-6)
+        descriptors.append(descriptor / (np.linalg.norm(descriptor) + 1e-6))
+    return np.stack(descriptors) if descriptors else np.empty((0, 128), dtype=np.float32)
 
 
 def encode_frames(

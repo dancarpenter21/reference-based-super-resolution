@@ -62,7 +62,7 @@ def train_model(
     cancel: Callable[[], bool] | None = None,
     device: torch.device | None = None,
     model_factory: Callable[[], nn.Module] = RRDBNet,
-    paired_anchors: list[dict] | None = None,
+    paired_manifest: list[dict] | None = None,
 ) -> tuple[Path, dict]:
     preset: Preset = PRESETS[preset_name]
     device = device or require_rocm()
@@ -75,9 +75,13 @@ def train_model(
         low_path,
         preset.patch_size,
         preset.max_steps * preset.batch_size,
-        paired_anchors=paired_anchors,
+        paired_manifest=paired_manifest,
     )
-    val_set = ReferenceVideoDataset(reference_path, low_path, preset.patch_size, 12, validation=True)
+    validation_pairs = (paired_manifest or [])[::10]
+    val_set = ReferenceVideoDataset(
+        reference_path, low_path, preset.patch_size, 12, validation=True,
+        paired_manifest=validation_pairs,
+    )
     train_loader = DataLoader(train_set, batch_size=preset.batch_size, shuffle=False, num_workers=0, pin_memory=True)
     val_loader = DataLoader(val_set, batch_size=1, num_workers=0)
     optimizer = torch.optim.AdamW(model.parameters(), lr=2e-5, betas=(0.9, 0.99), weight_decay=0)
@@ -147,4 +151,5 @@ def train_model(
         "baseline": baseline,
         "selected": selected,
         "elapsed_seconds": time.monotonic() - started,
+        "verified_pair_count": len(paired_manifest or []),
     }

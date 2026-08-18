@@ -52,24 +52,58 @@ class JobStore:
               error TEXT,
               cancel_requested INTEGER NOT NULL DEFAULT 0,
               created_at TEXT NOT NULL,
-              updated_at TEXT NOT NULL
+              updated_at TEXT NOT NULL,
+              phase TEXT NOT NULL DEFAULT 'analysis',
+              review_data TEXT,
+              review_revision INTEGER NOT NULL DEFAULT 0,
+              alignment_mode TEXT,
+              matching_mode TEXT NOT NULL DEFAULT 'guided'
             )
             """
         )
-        # Interrupted work is safe to restart. Training writes only versioned/best checkpoints.
+        columns = {row["name"] for row in db.execute("PRAGMA table_info(jobs)").fetchall()}
+        migrations = {
+            "phase": "ALTER TABLE jobs ADD COLUMN phase TEXT NOT NULL DEFAULT 'analysis'",
+            "review_data": "ALTER TABLE jobs ADD COLUMN review_data TEXT",
+            "review_revision": "ALTER TABLE jobs ADD COLUMN review_revision INTEGER NOT NULL DEFAULT 0",
+            "alignment_mode": "ALTER TABLE jobs ADD COLUMN alignment_mode TEXT",
+            "matching_mode": "ALTER TABLE jobs ADD COLUMN matching_mode TEXT NOT NULL DEFAULT 'guided'",
+        }
+        for name, sql in migrations.items():
+            if name not in columns:
+                db.execute(sql)
+        # Review is durable and must never be bypassed after a restart.
         db.execute(
             "UPDATE jobs SET state='queued', stage='queued', message='Recovered after restart' "
-            "WHERE state NOT IN ('completed','failed','cancelled')"
+            "WHERE state IN ('analyzing','training','upscaling','muxing')"
         )
         db.commit()
 
-    def create(self, low_path: str, reference_path: str, job_dir: str, preset: str) -> dict:
+    def create(
+        self, low_path: str, reference_path: str, job_dir: str, preset: str,
+        matching_mode: str = "guided",
+    ) -> dict:
+        if matching_mode not in {"guided", "reference_only"}:
+            raise ValueError(f"Unknown matching mode: {matching_mode}")
         job_id = Path(job_dir).name
         timestamp = now()
+        reference_only = matching_mode == "reference_only"
+        phase = "processing" if reference_only else "analysis"
+        review = {
+            "revision": 0, "approved_mode": "unpaired", "matching_mode": "reference_only",
+            "segments": [], "summary": {"proposed_segments": 0, "matched_seconds": 0.0},
+        } if reference_only else None
+        message = "Queued for reference-only processing" if reference_only else "Queued for frame analysis"
         self.connection().execute(
-            "INSERT INTO jobs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (job_id, "queued", "queued", 0.0, "Queued for processing", preset, low_path,
-             reference_path, job_dir, None, None, None, 0, timestamp, timestamp),
+            """INSERT INTO jobs (
+                id,state,stage,progress,message,preset,low_path,reference_path,job_dir,metrics,
+                warning,error,cancel_requested,created_at,updated_at,phase,review_data,review_revision,
+                alignment_mode,matching_mode
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (job_id, "queued", "queued", 0.0, message, preset, low_path,
+             reference_path, job_dir, None, None, None, 0, timestamp, timestamp,
+             phase, json.dumps(review) if review else None, 0,
+             "unpaired" if reference_only else None, matching_mode),
         )
         self.connection().commit()
         return self.get(job_id)
@@ -92,6 +126,7 @@ class JobStore:
         value = dict(row)
         value["cancel_requested"] = bool(value["cancel_requested"])
         value["metrics"] = json.loads(value["metrics"]) if value["metrics"] else None
+        value["review_data"] = json.loads(value["review_data"]) if value.get("review_data") else None
         return value
 
     def list_all(self) -> list[dict]:
@@ -116,28 +151,59 @@ class JobStore:
     def active_counts(self) -> dict[str, int]:
         rows = self.connection().execute(
             "SELECT state, COUNT(*) count FROM jobs "
-            "WHERE state NOT IN ('completed','failed','cancelled') GROUP BY state"
+            "WHERE state NOT IN ('completed','failed','cancelled','awaiting_match_review') GROUP BY state"
         ).fetchall()
         queued = sum(row["count"] for row in rows if row["state"] == "queued")
         processing = sum(row["count"] for row in rows if row["state"] != "queued")
-        return {"queued": queued, "processing": processing, "outstanding": queued + processing}
+        review = self.connection().execute(
+            "SELECT COUNT(*) count FROM jobs WHERE state='awaiting_match_review'"
+        ).fetchone()["count"]
+        return {"queued": queued, "processing": processing, "needs_review": review, "outstanding": queued + processing}
 
     def update(self, job_id: str, **fields) -> dict:
-        allowed = {"state", "stage", "progress", "message", "metrics", "warning", "error", "cancel_requested"}
+        allowed = {
+            "state", "stage", "progress", "message", "metrics", "warning", "error",
+            "cancel_requested", "phase", "review_data", "review_revision", "alignment_mode",
+        }
         fields = {key: value for key, value in fields.items() if key in allowed}
         if "metrics" in fields and fields["metrics"] is not None:
             fields["metrics"] = json.dumps(fields["metrics"])
+        if "review_data" in fields and fields["review_data"] is not None:
+            fields["review_data"] = json.dumps(fields["review_data"])
         fields["updated_at"] = now()
         sql = ", ".join(f"{key}=?" for key in fields)
         self.connection().execute(f"UPDATE jobs SET {sql} WHERE id=?", (*fields.values(), job_id))
         self.connection().commit()
         return self.get(job_id)
 
+    def save_review(self, job_id: str, review: dict, expected_revision: int | None = None) -> dict:
+        job = self.get(job_id)
+        if job["state"] != "awaiting_match_review":
+            raise RuntimeError("Frame matches can only be edited while review is awaiting input")
+        if expected_revision is not None and expected_revision != job["review_revision"]:
+            raise RuntimeError("Frame-match review changed; reload before saving")
+        revision = job["review_revision"] + 1
+        review = {**review, "revision": revision}
+        return self.update(job_id, review_data=review, review_revision=revision)
+
+    def approve_review(self, job_id: str, mode: str, expected_revision: int) -> dict:
+        job = self.get(job_id)
+        if job["state"] != "awaiting_match_review":
+            raise RuntimeError("This job is not awaiting frame-match review")
+        if expected_revision != job["review_revision"]:
+            raise RuntimeError("Frame-match review changed; reload before approving")
+        review = {**(job["review_data"] or {}), "approved_mode": mode}
+        return self.update(
+            job_id, review_data=review, phase="processing", state="queued", stage="queued",
+            message="Frame matches approved; queued for GPU processing", alignment_mode=mode,
+            warning=None, progress=0.07,
+        )
+
     def cancel(self, job_id: str) -> dict:
         job = self.get(job_id)
         if job["state"] in TERMINAL_STATES:
             return job
-        if job["state"] == "queued":
+        if job["state"] in {"queued", "awaiting_match_review"}:
             return self.update(job_id, state="cancelled", stage="cancelled", message="Job cancelled", progress=job["progress"])
         return self.update(job_id, cancel_requested=1, message="Cancellation requested")
 
@@ -145,14 +211,14 @@ class JobStore:
         db = self.connection()
         timestamp = now()
         with db:
-            queued = db.execute("SELECT id FROM jobs WHERE state='queued'").fetchall()
+            queued = db.execute("SELECT id FROM jobs WHERE state IN ('queued','awaiting_match_review')").fetchall()
             running = db.execute(
-                "SELECT id FROM jobs WHERE state NOT IN ('queued','completed','failed','cancelled') "
+                "SELECT id FROM jobs WHERE state NOT IN ('queued','awaiting_match_review','completed','failed','cancelled') "
                 "AND cancel_requested=0"
             ).fetchall()
             db.execute(
                 "UPDATE jobs SET state='cancelled', stage='cancelled', message='Job cancelled', "
-                "updated_at=? WHERE state='queued'",
+                "updated_at=? WHERE state IN ('queued','awaiting_match_review')",
                 (timestamp,),
             )
             db.execute(
