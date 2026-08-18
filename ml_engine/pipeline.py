@@ -101,7 +101,7 @@ def process_pipeline(
     )
     write_json(job_dir / "training.json", training)
     output = job_dir / "result.mp4"
-    emit("upscaling", 0.50, "Upscaling complete low-resolution video")
+    emit("upscaling", 0.50, "Upscaling low-resolution supplemental video")
     inference = upscale_video(
         low_path, checkpoint, output,
         progress=lambda p, m, metrics: emit("upscaling", 0.50 + p * 0.47, m, metrics), cancel=cancel,

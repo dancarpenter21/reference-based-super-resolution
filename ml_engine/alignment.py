@@ -223,7 +223,7 @@ def validate_segments(segments: list[dict], low_info: MediaInfo, reference_info:
     prior: MatchSegment | None = None
     for segment in confirmed:
         if not (0 <= segment.low_start.frame_index < segment.low_end.frame_index < low_info.frame_count):
-            raise ValueError(f"Segment {segment.id} has invalid complete-source boundaries")
+            raise ValueError(f"Segment {segment.id} has invalid supplemental-video boundaries")
         if not (0 <= segment.reference_start.frame_index < segment.reference_end.frame_index < reference_info.frame_count):
             raise ValueError(f"Segment {segment.id} has invalid reference boundaries")
         if prior and (segment.low_start.frame_index <= prior.low_end.frame_index or segment.reference_start.frame_index <= prior.reference_end.frame_index):

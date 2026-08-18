@@ -42,8 +42,10 @@ describe('App', () => {
 
   it('renders the two-video workflow and an empty durable queue', async () => {
     render(<App />)
-    expect(screen.getByText('01 · Complete source')).toBeInTheDocument()
-    expect(screen.getByText('02 · Detail reference')).toBeInTheDocument()
+    expect(screen.getByText('01 · Low-resolution supplement')).toBeInTheDocument()
+    expect(screen.getByText('02 · High-resolution reference')).toBeInTheDocument()
+    expect(screen.getByText(/Neither upload has to be complete/)).toBeInTheDocument()
+    expect(screen.getByText(/rendered result still follows the supplemental video's timeline/i)).toBeInTheDocument()
     expect(screen.getByRole('radio', { name: /find and match shared frames/i })).toBeChecked()
     expect(screen.getByRole('button', { name: /analyze frames/i })).toBeInTheDocument()
     expect(await screen.findByText(/No jobs yet/)).toBeInTheDocument()
@@ -187,12 +189,14 @@ describe('App', () => {
     render(<App />)
 
     expect(await screen.findByText('Start frames')).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /approve matches/i })).toBeDisabled()
+    expect(screen.getByRole('button', { name: /use confirmed pairs/i })).toBeDisabled()
+    expect(screen.getByRole('region', { name: /segment 1 contents/i })).toBeInTheDocument()
+    expect(screen.getByText(/Unmatched and rejected footage is not deleted/i)).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: /confirm boundaries/i }))
 
     await waitFor(() => expect(axios.put).toHaveBeenCalledWith(
       expect.stringMatching(/match-review$/), expect.objectContaining({ revision: 1 }),
     ))
-    expect(await screen.findByRole('button', { name: /approve matches/i })).toBeEnabled()
+    expect(await screen.findByRole('button', { name: /use confirmed pairs/i })).toBeEnabled()
   })
 })

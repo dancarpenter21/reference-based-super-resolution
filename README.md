@@ -1,22 +1,26 @@
 # Reference-Based Super-Resolution
 
-A local, single-GPU application that learns a conservative video upscaler from an incomplete higher-quality reference and applies it to every frame of a complete lower-quality video.
+A local, single-GPU application that learns a conservative, video-specific upscaler from two overlapping versions of the same video: a high-resolution reference and a low-resolution supplement. Either input may contain footage the other does not.
 
 The application proposes chronological overlap segments, then pauses for frame-match review before it starts GPU training. Different constant frame rates are handled with independent frame indices and per-segment timestamp mappings rather than one global offset. It never silently treats an automatic proposal as ground truth.
 
 ## Current workflow
 
-1. Upload the complete low-resolution video and the incomplete high-resolution reference.
+1. Upload the low-resolution supplement and the high-resolution reference. Neither input is assumed to be complete.
 2. Choose **Find and match shared frames** (recommended) or **Skip matching · reference only**.
 3. Guided jobs probe both streams, create lightweight navigation proxies, and propose same-order shared sections with gaps. Reference-only jobs skip this work and go directly to unpaired adaptation.
 4. For guided jobs, review every proposed section in the browser. Confirm or adjust its exact start/end frame pairs, reject it, or add a missing section from the two playheads.
 5. Fine-tune a pretrained RealESRGAN ×2 RRDB model without a GAN discriminator.
-6. Upscale the complete stream to 640×480 (4:3), stabilize residual detail across frames, and restore the original audio.
+6. Upscale the supplemental stream to 640×480 (4:3), stabilize residual detail across frames, and restore its original audio.
 7. Preview/download the MP4 and its JSON processing report, including the selected matching workflow.
 
-Review jobs survive browser and backend restarts and do not occupy the GPU queue. The review screen provides exact ±1/±10-frame stepping, timecodes, overlay comparison, segment splitting/merging, and keyboard stepping (left/right for the complete source, down/up for the reference; hold Shift for ten frames).
+Review jobs survive browser and backend restarts and do not occupy the GPU queue. The review screen provides clickable coverage timelines, start/middle/end filmstrips for every proposed match, synchronized range previews, exact ±1/±10-frame stepping, timecodes, overlay comparison, segment splitting/merging, and keyboard stepping (left/right for the supplement, down/up for the reference; hold Shift for ten frames).
 
-The supplied fixtures include 720×480 references and a 480×360, 29.97 fps complete source. The matcher treats differing frame rates, intermittent omissions, and non-square reference pixels independently; the user remains the final authority on which proposed segments are safe for paired supervision.
+Confirmed segments describe shared footage used for paired training. Rejecting a segment rejects only that training relationship; it does not delete footage. Uncolored timeline ranges make footage that appears in only one input visible during review.
+
+The current renderer follows the supplemental video's timeline. The coverage review now exposes high-resolution-only material instead of hiding it behind a “complete source” assumption, but assembling mutually exclusive ranges from both inputs into one ordered output requires an explicit edit/ordering plan and is not yet performed automatically.
+
+The supplied fixtures include 720×480 references and a 480×360, 29.97 fps supplemental source. The matcher treats differing frame rates, intermittent omissions, and non-square reference pixels independently; the user remains the final authority on which proposed segments are safe for paired supervision.
 
 ## ROCm setup (RX 9070 XT / WSL2)
 

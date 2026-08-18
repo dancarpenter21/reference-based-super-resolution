@@ -6,6 +6,10 @@ const API = import.meta.env.VITE_API_URL || 'http://localhost:8000/api/v1'
 const terminal = new Set(['completed', 'failed', 'cancelled'])
 const selectedJobKey = 'refsr-selected-job'
 const ORIGIN = API.replace('/api/v1', '')
+const streamLabel = {
+  low: 'Supplemental · low resolution',
+  reference: 'Reference · high resolution',
+}
 
 function matchingLabel(mode) {
   return mode === 'reference_only' ? 'reference only' : 'guided matching'
@@ -19,6 +23,36 @@ function formatTime(seconds = 0) {
   return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${secs}`
 }
 
+function durationBetween(start, end) {
+  return Math.max(0, end.time_seconds - start.time_seconds)
+}
+
+function SegmentFilmstrip({ jobId, segment, stream, onSeek }) {
+  const start = segment[`${stream}_start`]
+  const end = segment[`${stream}_end`]
+  const middleIndex = Math.round((start.frame_index + end.frame_index) / 2)
+  const middleTime = (start.time_seconds + end.time_seconds) / 2
+  const frames = [
+    { label: 'Start', frame_index: start.frame_index, time_seconds: start.time_seconds },
+    { label: 'Middle', frame_index: middleIndex, time_seconds: middleTime },
+    { label: 'End', frame_index: end.frame_index, time_seconds: end.time_seconds },
+  ]
+
+  return (
+    <div className="filmstrip-stream">
+      <div className="filmstrip-heading"><b>{streamLabel[stream]}</b><span>{formatTime(start.time_seconds)}–{formatTime(end.time_seconds)}</span></div>
+      <div className="filmstrip-frames">
+        {frames.map((frame) => (
+          <button key={frame.label} type="button" onClick={() => onSeek(stream, frame.time_seconds)} aria-label={`Show ${frame.label.toLowerCase()} of ${streamLabel[stream]}`}>
+            <img src={`${API}/jobs/${jobId}/frames/${stream}/${frame.frame_index}`} alt="" />
+            <span>{frame.label} · {formatTime(frame.time_seconds)}</span>
+          </button>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 function MatchReview({ job, onQueued }) {
   const [review, setReview] = useState(null)
   const [selected, setSelected] = useState(0)
@@ -26,6 +60,7 @@ function MatchReview({ job, onQueued }) {
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
   const [overlay, setOverlay] = useState(0)
+  const [previewing, setPreviewing] = useState(false)
   const lowVideo = useRef(null)
   const referenceVideo = useRef(null)
 
@@ -41,6 +76,26 @@ function MatchReview({ job, onQueued }) {
 
   useEffect(() => { load() }, [load])
   const segment = review?.segments?.[selected] || null
+
+  useEffect(() => {
+    setPreviewing(false)
+  }, [selected])
+
+  useEffect(() => {
+    if (!previewing || !segment) return undefined
+    const videos = [
+      [lowVideo.current, segment.low_end.time_seconds],
+      [referenceVideo.current, segment.reference_end.time_seconds],
+    ]
+    function stopAtBoundary() {
+      if (videos.some(([video, end]) => video && video.currentTime >= end)) {
+        videos.forEach(([video]) => video?.pause())
+        setPreviewing(false)
+      }
+    }
+    videos.forEach(([video]) => video?.addEventListener('timeupdate', stopAtBoundary))
+    return () => videos.forEach(([video]) => video?.removeEventListener('timeupdate', stopAtBoundary))
+  }, [previewing, segment])
 
   async function persist(segments) {
     setSaving(true)
@@ -165,6 +220,32 @@ function MatchReview({ job, onQueued }) {
     } finally { setSaving(false) }
   }
 
+  function seek(stream, time) {
+    const video = stream === 'low' ? lowVideo.current : referenceVideo.current
+    if (video) video.currentTime = time
+  }
+
+  function showBoundary(nextBoundary) {
+    setBoundary(nextBoundary)
+    if (!segment) return
+    seek('low', segment[`low_${nextBoundary}`].time_seconds)
+    seek('reference', segment[`reference_${nextBoundary}`].time_seconds)
+  }
+
+  function previewMatch() {
+    if (!segment) return
+    const videos = [lowVideo.current, referenceVideo.current]
+    if (previewing) {
+      videos.forEach((video) => video?.pause())
+      setPreviewing(false)
+      return
+    }
+    seek('low', segment.low_start.time_seconds)
+    seek('reference', segment.reference_start.time_seconds)
+    videos.forEach((video) => video?.play().catch(() => {}))
+    setPreviewing(true)
+  }
+
   if (!review) return <p className="message">Loading frame-match workspace…</p>
   const unresolved = review.segments.filter((item) => item.status === 'proposed').length
   const confirmed = review.segments.filter((item) => item.status === 'confirmed').length
@@ -174,18 +255,25 @@ function MatchReview({ job, onQueued }) {
 
   return (
     <div className="match-review">
+      <div className="review-intro">
+        <p className="eyebrow">SHARED-FOOTAGE REVIEW</p>
+        <h3>Teach the model which sections show the same footage.</h3>
+        <p>Each match connects a range in one video to the same range in the other. Confirmed matches become high/low training examples. Unmatched and rejected footage is not deleted; it simply is not used as a paired example.</p>
+      </div>
       <div className="review-summary">
         <div><b>{confirmed}</b><span>confirmed</span></div>
         <div><b>{unresolved}</b><span>needs review</span></div>
         <div><b>{formatTime(review.summary?.matched_seconds || 0)}</b><span>matched</span></div>
       </div>
-      <div className="timeline" aria-label="Complete source match timeline">
-        <span>Complete source</span><div>{review.segments.map((item) => <i key={item.id} className={`range ${item.status}`} style={{ left: `${item.low_start.time_seconds / lowDuration * 100}%`, width: `${Math.max(.4, (item.low_end.time_seconds - item.low_start.time_seconds) / lowDuration * 100)}%` }} />)}</div>
-        <span>Reference</span><div>{review.segments.map((item) => <i key={item.id} className={`range ${item.status}`} style={{ left: `${item.reference_start.time_seconds / refDuration * 100}%`, width: `${Math.max(.4, (item.reference_end.time_seconds - item.reference_start.time_seconds) / refDuration * 100)}%` }} />)}</div>
+      <div className="coverage-key"><span><i className="confirmed" />Confirmed match</span><span><i className="proposed" />Needs review</span><span><i className="unmatched" />Not in a match</span></div>
+      <div className="timeline" aria-label="Shared footage coverage">
+        <span>{streamLabel.low}</span><div>{review.segments.map((item, index) => <button aria-label={`Inspect segment ${index + 1} in supplemental video`} type="button" key={item.id} className={`range ${item.status}${selected === index ? ' selected' : ''}`} onClick={() => setSelected(index)} style={{ left: `${item.low_start.time_seconds / lowDuration * 100}%`, width: `${Math.max(.4, (item.low_end.time_seconds - item.low_start.time_seconds) / lowDuration * 100)}%` }} />)}</div>
+        <span>{streamLabel.reference}</span><div>{review.segments.map((item, index) => <button aria-label={`Inspect segment ${index + 1} in reference video`} type="button" key={item.id} className={`range ${item.status}${selected === index ? ' selected' : ''}`} onClick={() => setSelected(index)} style={{ left: `${item.reference_start.time_seconds / refDuration * 100}%`, width: `${Math.max(.4, (item.reference_end.time_seconds - item.reference_start.time_seconds) / refDuration * 100)}%` }} />)}</div>
+        <span /><div className="timeline-scale"><small>00:00</small><small>Uncolored areas are currently unmatched</small><small>End</small></div>
       </div>
       <div className="navigation-videos">
-        <label>Complete source<video ref={lowVideo} controls src={`${ORIGIN}${review.proxy_urls.low}`} /></label>
-        <label>Reference<video ref={referenceVideo} controls src={`${ORIGIN}${review.proxy_urls.reference}`} /></label>
+        <label>{streamLabel.low}<video ref={lowVideo} controls src={`${ORIGIN}${review.proxy_urls.low}`} /></label>
+        <label>{streamLabel.reference}<video ref={referenceVideo} controls src={`${ORIGIN}${review.proxy_urls.reference}`} /></label>
       </div>
       <div className="segment-toolbar">
         <select aria-label="Review segment" value={selected} onChange={(event) => setSelected(Number(event.target.value))}>
@@ -196,12 +284,22 @@ function MatchReview({ job, onQueued }) {
         <button onClick={mergeNext} disabled={!segment || selected >= review.segments.length - 1 || saving}>Merge next</button>
       </div>
       {segment && <>
-        <div className="boundary-tabs"><button className={boundary === 'start' ? 'selected' : ''} onClick={() => setBoundary('start')}>Start frames</button><button className={boundary === 'end' ? 'selected' : ''} onClick={() => setBoundary('end')}>End frames</button></div>
+        <section className="segment-inspector" aria-label={`Segment ${selected + 1} contents`}>
+          <div className="segment-inspector-heading">
+            <div><p className="eyebrow">SEGMENT {selected + 1} · {segment.status}</p><h3>What is in this match?</h3></div>
+            <div className="segment-facts"><span>{formatTime(durationBetween(segment.low_start, segment.low_end))} long</span><span>{Math.round((segment.confidence || 0) * 100)}% auto-match confidence</span></div>
+          </div>
+          <SegmentFilmstrip jobId={job.id} segment={segment} stream="low" onSeek={seek} />
+          <SegmentFilmstrip jobId={job.id} segment={segment} stream="reference" onSeek={seek} />
+          <button type="button" onClick={previewMatch}>{previewing ? 'Stop matched preview' : 'Play both matched ranges'}</button>
+        </section>
+        <div className="boundary-help"><b>Fine-tune the match boundaries</b><span>Compare the first or last paired frame. Adjust either side until both images show the same moment.</span></div>
+        <div className="boundary-tabs"><button className={boundary === 'start' ? 'selected' : ''} onClick={() => showBoundary('start')}>Start frames</button><button className={boundary === 'end' ? 'selected' : ''} onClick={() => showBoundary('end')}>End frames</button></div>
         <div className={`frame-compare${overlay ? ' overlay' : ''}`} style={{ '--overlay': overlay / 100 }}>
           {['low', 'reference'].map((stream) => {
             const ref = segment[`${stream}_${boundary}`]
             return <div className={`frame-pane pane-${stream}`} key={stream}>
-              <span>{stream === 'low' ? 'Complete source' : 'Reference'} · frame {ref.frame_index} · {formatTime(ref.time_seconds)}</span>
+              <span>{streamLabel[stream]} · frame {ref.frame_index} · {formatTime(ref.time_seconds)}</span>
               <img src={imageUrl(stream, ref)} alt={`${stream} ${boundary} frame`} />
               <div className="step-controls">{[-10, -1, 1, 10].map((amount) => <button key={amount} disabled={saving} onClick={() => step(stream, amount)}>{amount > 0 ? '+' : ''}{amount}</button>)}</div>
               <button className="snap" disabled={saving} onClick={() => snap(stream)}>Snap to other frame</button>
@@ -216,8 +314,9 @@ function MatchReview({ job, onQueued }) {
       </>}
       {error && <p className="alert error" role="alert">{error}</p>}
       <div className="approval-actions">
-        <button onClick={() => approve('unpaired')} disabled={saving || unresolved > 0}>Continue without paired matches</button>
-        <button className="primary" onClick={() => approve('paired')} disabled={saving || unresolved > 0 || confirmed === 0}>Approve matches and start processing</button>
+        <p>Resolve every proposal, then choose whether confirmed matches should supervise training.</p>
+        <button onClick={() => approve('unpaired')} disabled={saving || unresolved > 0}>Train without confirmed pairs</button>
+        <button className="primary" onClick={() => approve('paired')} disabled={saving || unresolved > 0 || confirmed === 0}>Use confirmed pairs and start processing</button>
       </div>
     </div>
   )
@@ -366,7 +465,7 @@ function App() {
   async function submit(event) {
     event.preventDefault()
     if (!low || !reference) {
-      setError('Select both the complete low-resolution video and the high-resolution reference.')
+      setError('Select both the low-resolution supplement and the high-resolution reference.')
       return
     }
     setError('')
@@ -436,17 +535,24 @@ function App() {
     <main>
       <header className="hero">
         <p className="eyebrow">LOCAL GPU RESTORATION</p>
-        <h1>Recover the complete cut.<br /><span>Keep the better detail.</span></h1>
-        <p className="lede">Adapt a faithful upscaler from an incomplete high-resolution reference, then restore every frame of the complete source.</p>
+        <h1>Two partial sources.<br /><span>One restoration model.</span></h1>
+        <p className="lede">Train a video-specific upscaler from two overlapping versions of the same video: a high-resolution reference and a low-resolution supplement. Either video may contain footage the other does not.</p>
       </header>
 
       <SystemStatus status={system} online={backendOnline} onRecheck={recheckGpu} />
 
       <section className="panel">
         <form onSubmit={submit}>
+          <div className="workflow-explainer" aria-label="How the workflow works">
+            <div><b>1 · Find overlap</b><span>Locate sections that appear in both videos, even when their edits or frame rates differ.</span></div>
+            <div><b>2 · Learn detail</b><span>Use confirmed high/low frame pairs plus the full high-resolution reference to adapt the upscaler.</span></div>
+            <div><b>3 · Restore footage</b><span>Upscale low-resolution sections using detail learned from the high-resolution version.</span></div>
+          </div>
+          <p className="input-note"><b>Neither upload has to be complete.</b> “Reference” describes the source of visual detail; “supplemental” describes the footage that needs upscaling.</p>
+          <p className="coverage-caveat"><b>Output coverage in this build:</b> the rendered result still follows the supplemental video's timeline. High-resolution-only ranges are exposed during review, but are not automatically inserted into the result because their ordering is ambiguous without an edit plan.</p>
           <div className="files">
-            <FileField label="01 · Complete source" description="The full low-resolution video. Its timing, frames, and audio are preserved." file={low} onChange={setLow} />
-            <FileField label="02 · Detail reference" description="The incomplete high-resolution footage used to adapt the restoration model." file={reference} onChange={setReference} />
+            <FileField label="01 · Low-resolution supplement" description="Lower-quality footage that fills gaps or extends the high-resolution version." file={low} onChange={setLow} />
+            <FileField label="02 · High-resolution reference" description="Higher-quality footage used as the detail target. It may also contain unique sections." file={reference} onChange={setReference} />
           </div>
           <fieldset className="mode-options">
             <legend>How should the reference be used?</legend>
