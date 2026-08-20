@@ -5,6 +5,7 @@ import subprocess
 from collections.abc import Iterator
 from dataclasses import asdict, dataclass
 from fractions import Fraction
+from functools import lru_cache
 from pathlib import Path
 
 import cv2
@@ -101,11 +102,73 @@ def sar_value(sar: str) -> float:
         return 1.0
 
 
+@lru_cache(maxsize=64)
+def detect_content_bounds(info: MediaInfo) -> tuple[int, int, int, int]:
+    """Find a persistent near-black outer border using fixed samples from the video."""
+    full = (0, 0, info.width, info.height)
+    if not Path(info.path).is_file():
+        return full
+    cap = cv2.VideoCapture(info.path)
+    if not cap.isOpened():
+        return full
+    row_profiles: list[np.ndarray] = []
+    column_profiles: list[np.ndarray] = []
+    sample_count = min(12, info.frame_count)
+    indices = np.linspace(
+        round((info.frame_count - 1) * 0.08),
+        round((info.frame_count - 1) * 0.92),
+        sample_count,
+        dtype=int,
+    )
+    try:
+        for index in np.unique(indices):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(index))
+            ok, frame = cap.read()
+            if not ok or frame.shape[:2] != (info.height, info.width):
+                continue
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            # A true black bar is dark across almost its entire row/column. Using
+            # the 90th percentile avoids treating ordinary dark scenery as a bar.
+            row_profiles.append(np.percentile(gray, 90, axis=1))
+            column_profiles.append(np.percentile(gray, 90, axis=0))
+    finally:
+        cap.release()
+    if len(row_profiles) < 3:
+        return full
+
+    persistent_rows = np.percentile(np.stack(row_profiles), 75, axis=0) < 16
+    persistent_columns = np.percentile(np.stack(column_profiles), 75, axis=0) < 16
+
+    def edge_run(mask: np.ndarray, reverse: bool, limit: int) -> int:
+        count = 0
+        for dark in (mask[::-1] if reverse else mask):
+            if not dark:
+                break
+            count += 1
+        return count if count <= limit else 0
+
+    top = edge_run(persistent_rows, False, max(1, round(info.height * 0.2)))
+    bottom = edge_run(persistent_rows, True, max(1, round(info.height * 0.2)))
+    left = edge_run(persistent_columns, False, max(1, round(info.width * 0.2)))
+    right = edge_run(persistent_columns, True, max(1, round(info.width * 0.2)))
+    # Ignore isolated codec-darkened edge pixels; they are not a meaningful border.
+    top = top if top >= 2 else 0
+    bottom = bottom if bottom >= 2 else 0
+    left = left if left >= 2 else 0
+    right = right if right >= 2 else 0
+    if info.width - left - right < info.width // 2 or info.height - top - bottom < info.height // 2:
+        return full
+    return left, top, info.width - right, info.height - bottom
+
+
 def normalize_reference_frame(frame: np.ndarray, info: MediaInfo) -> np.ndarray:
-    """Correct SAR, center-crop to 4:3, and resize to the canonical HR canvas."""
-    display_width = max(1, round(info.width * sar_value(info.sample_aspect_ratio)))
-    if display_width != info.width:
-        frame = cv2.resize(frame, (display_width, info.height), interpolation=cv2.INTER_AREA)
+    """Remove persistent borders, correct SAR, crop to 4:3, and resize to the HR canvas."""
+    left, top, right, bottom = detect_content_bounds(info)
+    frame = frame[top:bottom, left:right]
+    source_width = frame.shape[1]
+    display_width = max(1, round(source_width * sar_value(info.sample_aspect_ratio)))
+    if display_width != source_width:
+        frame = cv2.resize(frame, (display_width, frame.shape[0]), interpolation=cv2.INTER_AREA)
     h, w = frame.shape[:2]
     target_ratio = OUTPUT_WIDTH / OUTPUT_HEIGHT
     if w / h > target_ratio:

@@ -104,12 +104,18 @@ describe('App', () => {
     const cancelled = { ...activeJob, state: 'cancelled', stage: 'cancelled', message: 'Job cancelled' }
     mockGets([activeJob])
     axios.post.mockResolvedValue({ data: { affected: 1, jobs: [cancelled] } })
-    vi.spyOn(window, 'confirm').mockReturnValue(true)
     render(<App />)
 
     fireEvent.click(await screen.findByRole('button', { name: /cancel all active jobs/i }))
+    const dialog = screen.getByRole('dialog', { name: /stop all active work/i })
+    expect(dialog).toBeInTheDocument()
+    expect(screen.getByText(/completed jobs and their files will remain available/i)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /keep jobs running/i })).toHaveFocus()
+    expect(axios.post).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', { name: /cancel 1 active job/i }))
 
     await waitFor(() => expect(axios.post).toHaveBeenCalledWith(expect.stringMatching(/jobs\/cancel-all$/)))
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
     expect(await screen.findByText(/Job cancelled/)).toBeInTheDocument()
   })
 
@@ -181,22 +187,53 @@ describe('App', () => {
       if (url.endsWith('/match-review')) return Promise.resolve({ data: review })
       return Promise.resolve({ data: { jobs: [reviewJob] } })
     })
-    axios.put.mockResolvedValue({ data: {
-      ...review, revision: 2, segments: [{ ...segment, status: 'confirmed' }],
-      summary: { confirmed_segments: 1, proposed_segments: 0, matched_seconds: 4 },
-    } })
+    axios.put.mockImplementation((_, payload) => Promise.resolve({ data: {
+      ...review,
+      revision: payload.revision + 1,
+      segments: payload.segments,
+      summary: {
+        confirmed_segments: payload.segments.filter((item) => item.status === 'confirmed').length,
+        proposed_segments: payload.segments.filter((item) => item.status === 'proposed').length,
+        matched_seconds: 4,
+      },
+    } }))
 
-    render(<App />)
+    const playSpy = vi.spyOn(window.HTMLMediaElement.prototype, 'play').mockResolvedValue()
+    const { container } = render(<App />)
 
     expect(await screen.findByText('Start frames')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /use confirmed pairs/i })).toBeDisabled()
-    expect(screen.getByRole('region', { name: /segment 1 contents/i })).toBeInTheDocument()
+    expect(screen.queryByRole('region', { name: /segment 1 contents/i })).not.toBeInTheDocument()
+    expect(screen.getAllByText(/no shift from proposal/i)).toHaveLength(2)
+    expect(screen.getByRole('button', { name: /side by side/i })).toHaveAttribute('aria-pressed', 'true')
+    fireEvent.click(screen.getByRole('button', { name: /play both clips/i }))
+    await waitFor(() => expect(playSpy).toHaveBeenCalledTimes(2))
+    const comparisonVideos = container.querySelectorAll('.comparison-video video')
+    fireEvent.change(screen.getByRole('slider', { name: /matched segment position/i }), { target: { value: 500 } })
+    expect(comparisonVideos[0].currentTime).toBe(3)
+    expect(comparisonVideos[1].currentTime).toBe(3)
+    fireEvent.click(screen.getByRole('button', { name: /pause both clips/i }))
+    fireEvent.click(screen.getByRole('button', { name: /^overlay$/i }))
+    expect(screen.getByRole('button', { name: /^overlay$/i })).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByRole('slider', { name: /reference video opacity/i })).toHaveValue('50')
+    expect(screen.getByRole('tooltip', { name: /stack the playing reference/i })).toBeInTheDocument()
+    expect(screen.getByText(/advanced segment editing/i).closest('details')).not.toHaveAttribute('open')
     expect(screen.getByText(/Unmatched and rejected footage is not deleted/i)).toBeInTheDocument()
-    fireEvent.click(screen.getByRole('button', { name: /confirm boundaries/i }))
+    fireEvent.click(screen.getAllByRole('button', { name: /→ 1 frame/i })[0])
+    expect(await screen.findByText('+1 frame later')).toBeInTheDocument()
+    expect(axios.put).toHaveBeenCalledWith(
+      expect.stringMatching(/match-review$/),
+      expect.objectContaining({
+        revision: 1,
+        segments: [expect.objectContaining({
+          adjustment_baseline: expect.objectContaining({ low_start: 10, reference_start: 8 }),
+          low_start: expect.objectContaining({ frame_index: 11 }),
+        })],
+      }),
+    )
+    fireEvent.click(screen.getByRole('button', { name: /confirm frame match/i }))
 
-    await waitFor(() => expect(axios.put).toHaveBeenCalledWith(
-      expect.stringMatching(/match-review$/), expect.objectContaining({ revision: 1 }),
-    ))
+    await waitFor(() => expect(axios.put).toHaveBeenCalledTimes(2))
     expect(await screen.findByRole('button', { name: /use confirmed pairs/i })).toBeEnabled()
   })
 })

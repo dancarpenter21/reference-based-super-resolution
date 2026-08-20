@@ -14,13 +14,17 @@ The application proposes chronological overlap segments, then pauses for frame-m
 6. Upscale the supplemental stream to 640×480 (4:3), stabilize residual detail across frames, and restore its original audio.
 7. Preview/download the MP4 and its JSON processing report, including the selected matching workflow.
 
-Review jobs survive browser and backend restarts and do not occupy the GPU queue. The review screen provides clickable coverage timelines, start/middle/end filmstrips for every proposed match, synchronized range previews, exact ±1/±10-frame stepping, timecodes, overlay comparison, segment splitting/merging, and keyboard stepping (left/right for the supplement, down/up for the reference; hold Shift for ten frames).
+Review jobs survive browser and backend restarts and do not occupy the GPU queue. The review workspace walks through three stages: choose a shared section, compare its motion, then align and approve its exact boundary frames. Segment playback uses linked play/pause and proportional seeking, defaults to side-by-side video, and can play the two sources stacked with adjustable reference opacity. Live timecodes and frame estimates remain visible while the clips play; ongoing drift correction stays manual so the reviewer remains in control.
+
+Exact boundary review reports how far each clip’s selected boundary has moved from its original proposal and provides descriptive hover/focus tooltips, explicit earlier/later frame controls, nearby-frame matching, and keyboard stepping (left/right for the supplement, down/up for the reference; hold Shift for ten frames). Less-common full-source navigation, missing-match creation, splitting, and merging live under **Advanced segment editing** so they remain available without crowding the normal confirmation path.
 
 Confirmed segments describe shared footage used for paired training. Rejecting a segment rejects only that training relationship; it does not delete footage. Uncolored timeline ranges make footage that appears in only one input visible during review.
 
 The current renderer follows the supplemental video's timeline. The coverage review now exposes high-resolution-only material instead of hiding it behind a “complete source” assumption, but assembling mutually exclusive ranges from both inputs into one ordered output requires an explicit edit/ordering plan and is not yet performed automatically.
 
 The supplied fixtures include 720×480 references and a 480×360, 29.97 fps supplemental source. The matcher treats differing frame rates, intermittent omissions, and non-square reference pixels independently; the user remains the final authority on which proposed segments are safe for paired supervision.
+
+Reference preprocessing samples the video to detect persistent near-black outer borders, applies one fixed active-picture crop, then performs sample-aspect correction and 4:3 normalization. A fixed video-level crop prevents border pixels from entering training patches without introducing per-frame framing jitter; videos without a persistent border are left unchanged.
 
 ## ROCm setup (RX 9070 XT / WSL2)
 

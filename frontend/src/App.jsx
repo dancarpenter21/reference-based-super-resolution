@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import axios from 'axios'
 import './App.css'
 
@@ -27,28 +27,98 @@ function durationBetween(start, end) {
   return Math.max(0, end.time_seconds - start.time_seconds)
 }
 
-function SegmentFilmstrip({ jobId, segment, stream, onSeek }) {
-  const start = segment[`${stream}_start`]
-  const end = segment[`${stream}_end`]
-  const middleIndex = Math.round((start.frame_index + end.frame_index) / 2)
-  const middleTime = (start.time_seconds + end.time_seconds) / 2
-  const frames = [
-    { label: 'Start', frame_index: start.frame_index, time_seconds: start.time_seconds },
-    { label: 'Middle', frame_index: middleIndex, time_seconds: middleTime },
-    { label: 'End', frame_index: end.frame_index, time_seconds: end.time_seconds },
-  ]
+const boundaryKeys = ['low_start', 'low_end', 'reference_start', 'reference_end']
+
+function withAdjustmentBaseline(segment) {
+  if (segment.adjustment_baseline) return segment
+  return {
+    ...segment,
+    adjustment_baseline: Object.fromEntries(boundaryKeys.map((key) => [key, segment[key].frame_index])),
+  }
+}
+
+function withFreshAdjustmentBaseline(segment) {
+  const rest = { ...segment }
+  delete rest.adjustment_baseline
+  return withAdjustmentBaseline(rest)
+}
+
+function frameShift(segment, key) {
+  const baseline = segment.adjustment_baseline?.[key] ?? segment[key].frame_index
+  const delta = segment[key].frame_index - baseline
+  if (delta === 0) return { className: 'unchanged', label: 'No shift from proposal' }
+  const count = Math.abs(delta)
+  return {
+    className: delta < 0 ? 'earlier' : 'later',
+    label: `${delta > 0 ? '+' : '−'}${count} frame${count === 1 ? '' : 's'} ${delta < 0 ? 'earlier' : 'later'}`,
+  }
+}
+
+function TooltipButton({ tooltip, wrapperClassName = '', children, ...buttonProps }) {
+  const tooltipId = useId()
+  const describedBy = [buttonProps['aria-describedby'], tooltipId].filter(Boolean).join(' ')
 
   return (
-    <div className="filmstrip-stream">
-      <div className="filmstrip-heading"><b>{streamLabel[stream]}</b><span>{formatTime(start.time_seconds)}–{formatTime(end.time_seconds)}</span></div>
-      <div className="filmstrip-frames">
-        {frames.map((frame) => (
-          <button key={frame.label} type="button" onClick={() => onSeek(stream, frame.time_seconds)} aria-label={`Show ${frame.label.toLowerCase()} of ${streamLabel[stream]}`}>
-            <img src={`${API}/jobs/${jobId}/frames/${stream}/${frame.frame_index}`} alt="" />
-            <span>{frame.label} · {formatTime(frame.time_seconds)}</span>
-          </button>
-        ))}
-      </div>
+    <span
+      className={`tooltip-button ${wrapperClassName}`.trim()}
+      tabIndex={buttonProps.disabled ? 0 : undefined}
+      aria-label={buttonProps.disabled && typeof children === 'string' ? `${children}. ${tooltip}` : undefined}
+    >
+      <button {...buttonProps} aria-describedby={describedBy}>{children}</button>
+      <span className="button-tooltip" id={tooltipId} role="tooltip">{tooltip}</span>
+    </span>
+  )
+}
+
+function CancelJobsDialog({ activeCount, busy, error, onClose, onConfirm }) {
+  const titleId = useId()
+  const descriptionId = useId()
+  const dialogRef = useRef(null)
+  const cancelRef = useRef(null)
+
+  useEffect(() => {
+    cancelRef.current?.focus()
+  }, [])
+
+  useEffect(() => {
+    function keydown(event) {
+      if (event.key === 'Escape' && !busy) {
+        event.preventDefault()
+        onClose()
+      }
+      if (event.key !== 'Tab') return
+      const controls = [...(dialogRef.current?.querySelectorAll('button:not(:disabled)') || [])]
+      if (!controls.length) return
+      const first = controls[0]
+      const last = controls[controls.length - 1]
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault()
+        last.focus()
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault()
+        first.focus()
+      }
+    }
+    window.addEventListener('keydown', keydown)
+    return () => window.removeEventListener('keydown', keydown)
+  }, [busy, onClose])
+
+  return (
+    <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) onClose() }}>
+      <section ref={dialogRef} className="confirm-dialog" role="dialog" aria-modal="true" aria-labelledby={titleId} aria-describedby={descriptionId}>
+        <div className="dialog-mark" aria-hidden="true">!</div>
+        <p className="eyebrow">CANCEL ACTIVE JOBS</p>
+        <h2 id={titleId}>Stop all active work?</h2>
+        <p id={descriptionId} className="dialog-copy">
+          This will cancel {activeCount} queued, processing, or review {activeCount === 1 ? 'job' : 'jobs'}. Completed jobs and their files will remain available.
+        </p>
+        <p className="dialog-consequence">A running GPU step may take a moment to stop safely.</p>
+        {error && <p className="alert error" role="alert">{error}</p>}
+        <div className="dialog-actions">
+          <button ref={cancelRef} type="button" onClick={onClose} disabled={busy}>Keep jobs running</button>
+          <button className="destructive" type="button" onClick={onConfirm} disabled={busy}>{busy ? 'Cancelling…' : `Cancel ${activeCount} active ${activeCount === 1 ? 'job' : 'jobs'}`}</button>
+        </div>
+      </section>
     </div>
   )
 }
@@ -59,10 +129,15 @@ function MatchReview({ job, onQueued }) {
   const [boundary, setBoundary] = useState('start')
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
-  const [overlay, setOverlay] = useState(0)
-  const [previewing, setPreviewing] = useState(false)
+  const [comparisonMode, setComparisonMode] = useState('side-by-side')
+  const [overlayOpacity, setOverlayOpacity] = useState(50)
+  const [playing, setPlaying] = useState(false)
+  const [playbackProgress, setPlaybackProgress] = useState(0)
+  const [playheads, setPlayheads] = useState({ low: 0, reference: 0 })
   const lowVideo = useRef(null)
   const referenceVideo = useRef(null)
+  const sourceLowVideo = useRef(null)
+  const sourceReferenceVideo = useRef(null)
 
   const load = useCallback(async () => {
     try {
@@ -76,26 +151,47 @@ function MatchReview({ job, onQueued }) {
 
   useEffect(() => { load() }, [load])
   const segment = review?.segments?.[selected] || null
+  const segmentId = segment?.id
+  const segmentLowStart = segment?.low_start.time_seconds
+  const segmentReferenceStart = segment?.reference_start.time_seconds
 
   useEffect(() => {
-    setPreviewing(false)
-  }, [selected])
+    ;[lowVideo.current, referenceVideo.current].forEach((video) => video?.pause())
+    setPlaying(false)
+    setPlaybackProgress(0)
+    if (segmentId) {
+      setPlayheads({ low: segmentLowStart, reference: segmentReferenceStart })
+      if (lowVideo.current) lowVideo.current.currentTime = segmentLowStart
+      if (referenceVideo.current) referenceVideo.current.currentTime = segmentReferenceStart
+    }
+  }, [selected, segmentId, segmentLowStart, segmentReferenceStart])
 
   useEffect(() => {
-    if (!previewing || !segment) return undefined
-    const videos = [
-      [lowVideo.current, segment.low_end.time_seconds],
-      [referenceVideo.current, segment.reference_end.time_seconds],
-    ]
-    function stopAtBoundary() {
-      if (videos.some(([video, end]) => video && video.currentTime >= end)) {
-        videos.forEach(([video]) => video?.pause())
-        setPreviewing(false)
+    if (!segment) return undefined
+    const videos = { low: lowVideo.current, reference: referenceVideo.current }
+    function update(stream) {
+      const video = videos[stream]
+      if (!video) return
+      setPlayheads((current) => ({ ...current, [stream]: video.currentTime }))
+      if (stream === 'low') {
+        const duration = durationBetween(segment.low_start, segment.low_end) || 1
+        setPlaybackProgress(Math.max(0, Math.min(1, (video.currentTime - segment.low_start.time_seconds) / duration)))
+      }
+      const end = segment[`${stream}_end`].time_seconds
+      if (playing && video.currentTime >= end - .002) {
+        Object.values(videos).forEach((item) => item?.pause())
+        setPlaying(false)
       }
     }
-    videos.forEach(([video]) => video?.addEventListener('timeupdate', stopAtBoundary))
-    return () => videos.forEach(([video]) => video?.removeEventListener('timeupdate', stopAtBoundary))
-  }, [previewing, segment])
+    const lowUpdate = () => update('low')
+    const referenceUpdate = () => update('reference')
+    videos.low?.addEventListener('timeupdate', lowUpdate)
+    videos.reference?.addEventListener('timeupdate', referenceUpdate)
+    return () => {
+      videos.low?.removeEventListener('timeupdate', lowUpdate)
+      videos.reference?.removeEventListener('timeupdate', referenceUpdate)
+    }
+  }, [playing, segment])
 
   async function persist(segments) {
     setSaving(true)
@@ -136,8 +232,9 @@ function MatchReview({ job, onQueued }) {
     const key = `${stream}_${boundary}`
     const info = review.media[stream]
     changedSegment((item) => {
-      const next = Math.max(0, Math.min(info.frame_count - 1, item[key].frame_index + amount))
-      return { ...item, [key]: { frame_index: next, pts: next, time_seconds: next / info.fps }, status: 'proposed', origin: 'manual' }
+      const based = withAdjustmentBaseline(item)
+      const next = Math.max(0, Math.min(info.frame_count - 1, based[key].frame_index + amount))
+      return { ...based, [key]: { frame_index: next, pts: next, time_seconds: next / info.fps }, status: 'proposed', origin: 'manual' }
     })
   }
 
@@ -155,8 +252,8 @@ function MatchReview({ job, onQueued }) {
   })
 
   async function addFromPlayheads() {
-    const lowFrame = Math.round((lowVideo.current?.currentTime || 0) * review.media.low.fps)
-    const referenceFrame = Math.round((referenceVideo.current?.currentTime || 0) * review.media.reference.fps)
+    const lowFrame = Math.round((sourceLowVideo.current?.currentTime || 0) * review.media.low.fps)
+    const referenceFrame = Math.round((sourceReferenceVideo.current?.currentTime || 0) * review.media.reference.fps)
     setSaving(true)
     try {
       const response = await axios.post(`${API}/jobs/${job.id}/match-review/expand`, {
@@ -179,15 +276,15 @@ function MatchReview({ job, onQueued }) {
     }
     const lowRef = { frame_index: lowIndex, pts: lowIndex, time_seconds: lowIndex / review.media.low.fps }
     const highRef = { frame_index: refIndex, pts: refIndex, time_seconds: refIndex / review.media.reference.fps }
-    const left = { ...segment, id: `${segment.id}-a`, low_end: lowRef, reference_end: highRef, status: 'proposed', origin: 'manual' }
-    const right = { ...segment, id: `${segment.id}-b`, low_start: lowRef, reference_start: highRef, status: 'proposed', origin: 'manual' }
+    const left = withFreshAdjustmentBaseline({ ...segment, id: `${segment.id}-a`, low_end: lowRef, reference_end: highRef, status: 'proposed', origin: 'manual' })
+    const right = withFreshAdjustmentBaseline({ ...segment, id: `${segment.id}-b`, low_start: lowRef, reference_start: highRef, status: 'proposed', origin: 'manual' })
     persist(review.segments.flatMap((item, index) => index === selected ? [left, right] : [item]))
   }
 
   function mergeNext() {
     if (!segment || selected >= review.segments.length - 1) return
     const next = review.segments[selected + 1]
-    const merged = { ...segment, id: `${segment.id}-merged`, low_end: next.low_end, reference_end: next.reference_end, status: 'proposed', origin: 'manual' }
+    const merged = withFreshAdjustmentBaseline({ ...segment, id: `${segment.id}-merged`, low_end: next.low_end, reference_end: next.reference_end, status: 'proposed', origin: 'manual' })
     persist(review.segments.filter((_, index) => index !== selected + 1).map((item, index) => index === selected ? merged : item))
   }
 
@@ -201,9 +298,11 @@ function MatchReview({ job, onQueued }) {
         fixed_frame_index: segment[`${fixedStream}_${boundary}`].frame_index,
         target_frame_index: segment[`${targetStream}_${boundary}`].frame_index,
       })
-      const segments = review.segments.map((item, index) => index === selected ? {
-        ...item, [`${targetStream}_${boundary}`]: response.data.frame, status: 'proposed', origin: 'manual',
-      } : item)
+      const segments = review.segments.map((item, index) => {
+        if (index !== selected) return item
+        const based = withAdjustmentBaseline(item)
+        return { ...based, [`${targetStream}_${boundary}`]: response.data.frame, status: 'proposed', origin: 'manual' }
+      })
       await persist(segments)
     } catch (requestError) {
       setError(requestError.response?.data?.detail || requestError.message)
@@ -220,30 +319,39 @@ function MatchReview({ job, onQueued }) {
     } finally { setSaving(false) }
   }
 
-  function seek(stream, time) {
-    const video = stream === 'low' ? lowVideo.current : referenceVideo.current
-    if (video) video.currentTime = time
+  function seekComparison(progress) {
+    if (!segment) return
+    const next = Math.max(0, Math.min(1, Number(progress)))
+    const times = {
+      low: segment.low_start.time_seconds + durationBetween(segment.low_start, segment.low_end) * next,
+      reference: segment.reference_start.time_seconds + durationBetween(segment.reference_start, segment.reference_end) * next,
+    }
+    if (lowVideo.current) lowVideo.current.currentTime = times.low
+    if (referenceVideo.current) referenceVideo.current.currentTime = times.reference
+    setPlaybackProgress(next)
+    setPlayheads(times)
   }
 
   function showBoundary(nextBoundary) {
     setBoundary(nextBoundary)
-    if (!segment) return
-    seek('low', segment[`low_${nextBoundary}`].time_seconds)
-    seek('reference', segment[`reference_${nextBoundary}`].time_seconds)
+    seekComparison(nextBoundary === 'start' ? 0 : 1)
   }
 
-  function previewMatch() {
+  function togglePlayback() {
     if (!segment) return
     const videos = [lowVideo.current, referenceVideo.current]
-    if (previewing) {
+    if (playing) {
       videos.forEach((video) => video?.pause())
-      setPreviewing(false)
+      setPlaying(false)
       return
     }
-    seek('low', segment.low_start.time_seconds)
-    seek('reference', segment.reference_start.time_seconds)
-    videos.forEach((video) => video?.play().catch(() => {}))
-    setPreviewing(true)
+    const nextProgress = playbackProgress >= .999 ? 0 : playbackProgress
+    seekComparison(nextProgress)
+    const attempts = videos.map((video) => video?.play()).filter(Boolean)
+    Promise.all(attempts).then(() => setPlaying(true)).catch(() => {
+      videos.forEach((video) => video?.pause())
+      setError('Playback could not start. Allow video playback in the browser and try again.')
+    })
   }
 
   if (!review) return <p className="message">Loading frame-match workspace…</p>
@@ -252,6 +360,7 @@ function MatchReview({ job, onQueued }) {
   const lowDuration = review.media.low.duration || 1
   const refDuration = review.media.reference.duration || 1
   const imageUrl = (stream, ref) => `${API}/jobs/${job.id}/frames/${stream}/${ref.frame_index}`
+  const playbackFrame = (stream) => Math.round(playheads[stream] * review.media[stream].fps)
 
   return (
     <div className="match-review">
@@ -265,58 +374,96 @@ function MatchReview({ job, onQueued }) {
         <div><b>{unresolved}</b><span>needs review</span></div>
         <div><b>{formatTime(review.summary?.matched_seconds || 0)}</b><span>matched</span></div>
       </div>
-      <div className="coverage-key"><span><i className="confirmed" />Confirmed match</span><span><i className="proposed" />Needs review</span><span><i className="unmatched" />Not in a match</span></div>
-      <div className="timeline" aria-label="Shared footage coverage">
-        <span>{streamLabel.low}</span><div>{review.segments.map((item, index) => <button aria-label={`Inspect segment ${index + 1} in supplemental video`} type="button" key={item.id} className={`range ${item.status}${selected === index ? ' selected' : ''}`} onClick={() => setSelected(index)} style={{ left: `${item.low_start.time_seconds / lowDuration * 100}%`, width: `${Math.max(.4, (item.low_end.time_seconds - item.low_start.time_seconds) / lowDuration * 100)}%` }} />)}</div>
-        <span>{streamLabel.reference}</span><div>{review.segments.map((item, index) => <button aria-label={`Inspect segment ${index + 1} in reference video`} type="button" key={item.id} className={`range ${item.status}${selected === index ? ' selected' : ''}`} onClick={() => setSelected(index)} style={{ left: `${item.reference_start.time_seconds / refDuration * 100}%`, width: `${Math.max(.4, (item.reference_end.time_seconds - item.reference_start.time_seconds) / refDuration * 100)}%` }} />)}</div>
-        <span /><div className="timeline-scale"><small>00:00</small><small>Uncolored areas are currently unmatched</small><small>End</small></div>
-      </div>
-      <div className="navigation-videos">
-        <label>{streamLabel.low}<video ref={lowVideo} controls src={`${ORIGIN}${review.proxy_urls.low}`} /></label>
-        <label>{streamLabel.reference}<video ref={referenceVideo} controls src={`${ORIGIN}${review.proxy_urls.reference}`} /></label>
-      </div>
-      <div className="segment-toolbar">
-        <select aria-label="Review segment" value={selected} onChange={(event) => setSelected(Number(event.target.value))}>
-          {review.segments.map((item, index) => <option key={item.id} value={index}>Segment {index + 1} · {item.status}</option>)}
-        </select>
-        <button onClick={addFromPlayheads} disabled={saving}>Add from playheads</button>
-        <button onClick={splitAtPlayheads} disabled={!segment || saving}>Split at playheads</button>
-        <button onClick={mergeNext} disabled={!segment || selected >= review.segments.length - 1 || saving}>Merge next</button>
-      </div>
+      <section className="review-stage match-navigation" aria-labelledby="choose-match-heading">
+        <div className="stage-heading"><span>1</span><div><p className="eyebrow">CHOOSE A MATCH</p><h3 id="choose-match-heading">Select a shared section to review</h3></div></div>
+        <div className="coverage-key"><span><i className="confirmed" />Confirmed match</span><span><i className="proposed" />Needs review</span><span><i className="unmatched" />Not in a match</span></div>
+        <div className="timeline" aria-label="Shared footage coverage">
+          <span>{streamLabel.low}</span><div>{review.segments.map((item, index) => <button title={`Open segment ${index + 1}: ${item.status}.`} aria-label={`Inspect segment ${index + 1} in supplemental video`} type="button" key={item.id} className={`range ${item.status}${selected === index ? ' selected' : ''}`} onClick={() => setSelected(index)} style={{ left: `${item.low_start.time_seconds / lowDuration * 100}%`, width: `${Math.max(.4, (item.low_end.time_seconds - item.low_start.time_seconds) / lowDuration * 100)}%` }} />)}</div>
+          <span>{streamLabel.reference}</span><div>{review.segments.map((item, index) => <button title={`Open segment ${index + 1}: ${item.status}.`} aria-label={`Inspect segment ${index + 1} in reference video`} type="button" key={item.id} className={`range ${item.status}${selected === index ? ' selected' : ''}`} onClick={() => setSelected(index)} style={{ left: `${item.reference_start.time_seconds / refDuration * 100}%`, width: `${Math.max(.4, (item.reference_end.time_seconds - item.reference_start.time_seconds) / refDuration * 100)}%` }} />)}</div>
+          <span /><div className="timeline-scale"><small>00:00</small><small>Uncolored areas are currently unmatched</small><small>End</small></div>
+        </div>
+        <div className="segment-navigator">
+          <TooltipButton type="button" onClick={() => setSelected((current) => Math.max(0, current - 1))} disabled={selected === 0} tooltip="Open the previous proposed or confirmed match without changing this one.">← Previous</TooltipButton>
+          <label>Current match<select aria-label="Review segment" value={selected} onChange={(event) => setSelected(Number(event.target.value))}>{review.segments.map((item, index) => <option key={item.id} value={index}>Segment {index + 1} · {item.status}</option>)}</select></label>
+          <TooltipButton type="button" onClick={() => setSelected((current) => Math.min(review.segments.length - 1, current + 1))} disabled={selected >= review.segments.length - 1} tooltip="Open the next proposed or confirmed match without changing this one.">Next →</TooltipButton>
+        </div>
+        {segment && <div className="selected-match-summary"><b>Segment {selected + 1} · {segment.status}</b><span>{formatTime(durationBetween(segment.low_start, segment.low_end))} long</span><span>{Math.round((segment.confidence || 0) * 100)}% automatic confidence</span></div>}
+      </section>
       {segment && <>
-        <section className="segment-inspector" aria-label={`Segment ${selected + 1} contents`}>
-          <div className="segment-inspector-heading">
-            <div><p className="eyebrow">SEGMENT {selected + 1} · {segment.status}</p><h3>What is in this match?</h3></div>
-            <div className="segment-facts"><span>{formatTime(durationBetween(segment.low_start, segment.low_end))} long</span><span>{Math.round((segment.confidence || 0) * 100)}% auto-match confidence</span></div>
+        <section className="review-stage playback-stage" aria-labelledby="compare-segment-heading">
+          <div className="stage-heading-row">
+            <div className="stage-heading"><span>2</span><div><p className="eyebrow">COMPARE THE SEGMENT</p><h3 id="compare-segment-heading">Check that both clips show the same motion</h3></div></div>
+            <div className="view-toggle" aria-label="Comparison view">
+              <TooltipButton type="button" className={comparisonMode === 'side-by-side' ? 'selected' : ''} aria-pressed={comparisonMode === 'side-by-side'} onClick={() => setComparisonMode('side-by-side')} tooltip="Show both videos next to each other while keeping their linked playheads.">Side by side</TooltipButton>
+              <TooltipButton type="button" className={comparisonMode === 'overlay' ? 'selected' : ''} aria-pressed={comparisonMode === 'overlay'} onClick={() => setComparisonMode('overlay')} tooltip="Stack the playing reference over the supplemental video so motion differences are easier to spot.">Overlay</TooltipButton>
+            </div>
           </div>
-          <SegmentFilmstrip jobId={job.id} segment={segment} stream="low" onSeek={seek} />
-          <SegmentFilmstrip jobId={job.id} segment={segment} stream="reference" onSeek={seek} />
-          <button type="button" onClick={previewMatch}>{previewing ? 'Stop matched preview' : 'Play both matched ranges'}</button>
+          <p className="stage-help">Playback starts from each clip’s matched boundary. Controls are linked, but the app does not silently correct drift while the clips play.</p>
+          <div className={`comparison-visual ${comparisonMode}`}>
+            <figure className="comparison-video comparison-low">
+              <video ref={lowVideo} muted playsInline preload="metadata" src={`${ORIGIN}${review.proxy_urls.low}`} onLoadedMetadata={() => seekComparison(playbackProgress)} />
+              <figcaption><b>{streamLabel.low}</b><span>frame {playbackFrame('low')} · {formatTime(playheads.low)}</span></figcaption>
+            </figure>
+            <figure className="comparison-video comparison-reference" style={comparisonMode === 'overlay' ? { opacity: overlayOpacity / 100 } : undefined}>
+              <video ref={referenceVideo} muted playsInline preload="metadata" src={`${ORIGIN}${review.proxy_urls.reference}`} onLoadedMetadata={() => seekComparison(playbackProgress)} />
+              <figcaption><b>{streamLabel.reference}</b><span>frame {playbackFrame('reference')} · {formatTime(playheads.reference)}</span></figcaption>
+            </figure>
+          </div>
+          {comparisonMode === 'overlay' && <label className="overlay-control"><span>Reference opacity</span><input aria-label="Reference video opacity" type="range" min="0" max="100" value={overlayOpacity} onChange={(event) => setOverlayOpacity(Number(event.target.value))} /><output>{overlayOpacity}%</output></label>}
+          <div className="playback-controls">
+            <TooltipButton type="button" className="primary" onClick={togglePlayback} tooltip={playing ? 'Pause both videos at their current positions.' : 'Start both videos from the linked position shown on the segment scrubber.'}>{playing ? 'Pause both clips' : 'Play both clips'}</TooltipButton>
+            <TooltipButton type="button" onClick={() => { ;[lowVideo.current, referenceVideo.current].forEach((video) => video?.pause()); setPlaying(false); seekComparison(0) }} tooltip="Pause both videos and return each one to this segment’s start boundary.">Restart segment</TooltipButton>
+            <label className="segment-scrubber"><span>Matched position</span><input aria-label="Matched segment position" type="range" min="0" max="1000" value={Math.round(playbackProgress * 1000)} onChange={(event) => seekComparison(Number(event.target.value) / 1000)} /><output>{Math.round(playbackProgress * 100)}%</output></label>
+          </div>
         </section>
-        <div className="boundary-help"><b>Fine-tune the match boundaries</b><span>Compare the first or last paired frame. Adjust either side until both images show the same moment.</span></div>
-        <div className="boundary-tabs"><button className={boundary === 'start' ? 'selected' : ''} onClick={() => showBoundary('start')}>Start frames</button><button className={boundary === 'end' ? 'selected' : ''} onClick={() => showBoundary('end')}>End frames</button></div>
-        <div className={`frame-compare${overlay ? ' overlay' : ''}`} style={{ '--overlay': overlay / 100 }}>
+        <section className="review-stage boundary-stage" aria-labelledby="match-frames-heading">
+          <div className="stage-heading"><span>3</span><div><p className="eyebrow">MATCH EXACT FRAMES</p><h3 id="match-frames-heading">Align the first and last moments</h3></div></div>
+          <p className="stage-help">Choose a boundary, then move either clip until both images show the same instant. Every adjustment is saved to this segment.</p>
+          <div className="boundary-tabs">
+            <TooltipButton type="button" className={boundary === 'start' ? 'selected' : ''} aria-pressed={boundary === 'start'} onClick={() => showBoundary('start')} tooltip="Compare and adjust the first paired frame used by this match.">Start frames</TooltipButton>
+            <TooltipButton type="button" className={boundary === 'end' ? 'selected' : ''} aria-pressed={boundary === 'end'} onClick={() => showBoundary('end')} tooltip="Compare and adjust the last paired frame used by this match.">End frames</TooltipButton>
+          </div>
+          <div className="frame-compare">
           {['low', 'reference'].map((stream) => {
-            const ref = segment[`${stream}_${boundary}`]
+            const key = `${stream}_${boundary}`
+            const ref = segment[key]
+            const shift = frameShift(segment, key)
             return <div className={`frame-pane pane-${stream}`} key={stream}>
-              <span>{streamLabel[stream]} · frame {ref.frame_index} · {formatTime(ref.time_seconds)}</span>
+              <div className="frame-pane-heading">
+                <span><b>{streamLabel[stream]}</b> · frame {ref.frame_index} · {formatTime(ref.time_seconds)}</span>
+                <strong className={`frame-shift ${shift.className}`} aria-live="polite">{shift.label}</strong>
+              </div>
               <img src={imageUrl(stream, ref)} alt={`${stream} ${boundary} frame`} />
-              <div className="step-controls">{[-10, -1, 1, 10].map((amount) => <button key={amount} disabled={saving} onClick={() => step(stream, amount)}>{amount > 0 ? '+' : ''}{amount}</button>)}</div>
-              <button className="snap" disabled={saving} onClick={() => snap(stream)}>Snap to other frame</button>
+              <div className="step-controls">{[-10, -1, 1, 10].map((amount) => <TooltipButton key={amount} type="button" disabled={saving} onClick={() => step(stream, amount)} tooltip={`Move the ${stream === 'low' ? 'supplemental' : 'reference'} ${boundary} boundary ${Math.abs(amount)} frame${Math.abs(amount) === 1 ? '' : 's'} ${amount < 0 ? 'earlier' : 'later'}.`}>{amount < 0 ? '←' : '→'} {Math.abs(amount)} frame{Math.abs(amount) === 1 ? '' : 's'}</TooltipButton>)}</div>
+              <TooltipButton wrapperClassName="snap-tooltip" type="button" className="snap" disabled={saving} onClick={() => snap(stream)} tooltip={`Keep the other frame fixed and search nearby ${stream === 'low' ? 'supplemental' : 'reference'} frames for the closest visual match.`}>Find closest {stream === 'low' ? 'supplemental' : 'reference'} frame</TooltipButton>
             </div>
           })}
-        </div>
-        <label className="overlay-control">Overlay comparison <input type="range" min="0" max="100" value={overlay} onChange={(event) => setOverlay(Number(event.target.value))} /></label>
-        <div className="review-actions">
-          <button onClick={() => resolveSelected('rejected')} disabled={saving}>Reject segment</button>
-          <button className="primary" onClick={() => resolveSelected('confirmed')} disabled={saving}>Confirm boundaries</button>
-        </div>
+          </div>
+          <p className="keyboard-help">Keyboard: ←/→ steps the supplemental frame; ↓/↑ steps the reference frame. Hold Shift to move 10 frames.</p>
+          <div className="review-actions">
+            <TooltipButton type="button" onClick={() => resolveSelected('rejected')} disabled={saving} tooltip="Exclude this proposed relationship from paired training. Neither source clip is deleted.">Reject this match</TooltipButton>
+            <TooltipButton type="button" className="primary" onClick={() => resolveSelected('confirmed')} disabled={saving} tooltip="Save these start and end frame pairs as approved training footage, then open the next unresolved match.">Confirm frame match</TooltipButton>
+          </div>
+        </section>
       </>}
+      <details className="advanced-editing">
+        <summary>Advanced segment editing</summary>
+        <p>Browse both full sources independently to add missing shared footage. Splitting uses the linked position in the selected segment above.</p>
+        <div className="source-videos">
+          <label>{streamLabel.low}<video ref={sourceLowVideo} controls muted playsInline preload="metadata" src={`${ORIGIN}${review.proxy_urls.low}`} /></label>
+          <label>{streamLabel.reference}<video ref={sourceReferenceVideo} controls muted playsInline preload="metadata" src={`${ORIGIN}${review.proxy_urls.reference}`} /></label>
+        </div>
+        <div className="advanced-actions">
+          <TooltipButton type="button" onClick={addFromPlayheads} disabled={saving} tooltip="Create a new 10-second proposed match centered on the two independently positioned source playheads.">Add match from source playheads</TooltipButton>
+          <TooltipButton type="button" onClick={splitAtPlayheads} disabled={!segment || saving} tooltip="Divide the selected match at the linked playback position; both resulting matches will need confirmation.">Split selected match here</TooltipButton>
+          <TooltipButton type="button" onClick={mergeNext} disabled={!segment || selected >= review.segments.length - 1 || saving} tooltip="Join this match to the next match, using this start boundary and the next match’s end boundary.">Merge with next match</TooltipButton>
+        </div>
+      </details>
       {error && <p className="alert error" role="alert">{error}</p>}
       <div className="approval-actions">
         <p>Resolve every proposal, then choose whether confirmed matches should supervise training.</p>
-        <button onClick={() => approve('unpaired')} disabled={saving || unresolved > 0}>Train without confirmed pairs</button>
-        <button className="primary" onClick={() => approve('paired')} disabled={saving || unresolved > 0 || confirmed === 0}>Use confirmed pairs and start processing</button>
+        <TooltipButton type="button" onClick={() => approve('unpaired')} disabled={saving || unresolved > 0} tooltip="Start adaptation without using any confirmed high/low frame pairs. Every proposal must be resolved first.">Train without confirmed pairs</TooltipButton>
+        <TooltipButton type="button" className="primary" onClick={() => approve('paired')} disabled={saving || unresolved > 0 || confirmed === 0} tooltip="Use all confirmed matches as paired supervision and queue this job for processing.">Use confirmed pairs and start processing</TooltipButton>
       </div>
     </div>
   )
@@ -411,6 +558,9 @@ function App() {
   const [jobsError, setJobsError] = useState('')
   const [system, setSystem] = useState(null)
   const [backendOnline, setBackendOnline] = useState(null)
+  const [cancelAllOpen, setCancelAllOpen] = useState(false)
+  const [cancellingAll, setCancellingAll] = useState(false)
+  const [cancelAllError, setCancelAllError] = useState('')
 
   const refreshJobs = useCallback(async () => {
     try {
@@ -459,6 +609,7 @@ function App() {
 
   const job = useMemo(() => jobs.find((item) => item.id === effectiveSelectedId) || null, [effectiveSelectedId, jobs])
   const busy = jobs.some((item) => !terminal.has(item.state) && item.state !== 'awaiting_match_review')
+  const activeCount = jobs.filter((item) => !terminal.has(item.state)).length
   const progress = Math.round((job?.progress || 0) * 100)
   const eta = job?.eta_seconds ? `${Math.max(1, Math.round(job.eta_seconds / 60))} min remaining` : null
 
@@ -497,13 +648,22 @@ function App() {
   }
 
   async function cancelAll() {
-    if (!window.confirm('Cancel every queued or running job?')) return
+    setCancellingAll(true)
+    setCancelAllError('')
     try {
       const response = await axios.post(`${API}/jobs/cancel-all`)
       setJobs(response.data.jobs)
+      setCancelAllOpen(false)
     } catch (requestError) {
-      setError(requestError.response?.data?.detail || requestError.message)
+      setCancelAllError(requestError.response?.data?.detail || requestError.message)
+    } finally {
+      setCancellingAll(false)
     }
+  }
+
+  function requestCancelAll() {
+    setCancelAllError('')
+    setCancelAllOpen(true)
   }
 
   async function recheckGpu() {
@@ -582,7 +742,7 @@ function App() {
         {error && <p className="alert error" role="alert">{error}</p>}
       </section>
 
-      <JobList jobs={jobs} selectedId={effectiveSelectedId} onSelect={setSelectedId} onCancelAll={cancelAll} />
+      <JobList jobs={jobs} selectedId={effectiveSelectedId} onSelect={setSelectedId} onCancelAll={requestCancelAll} />
 
       {job && (
         <section className="panel job" aria-live="polite">
@@ -613,6 +773,7 @@ function App() {
           </div>
         </section>
       )}
+      {cancelAllOpen && <CancelJobsDialog activeCount={activeCount} busy={cancellingAll} error={cancelAllError} onClose={() => setCancelAllOpen(false)} onConfirm={cancelAll} />}
     </main>
   )
 }
