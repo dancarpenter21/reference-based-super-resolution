@@ -150,6 +150,13 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .frame-shift.earlier { border-color: #70582d; color: #e0bd70; }
 .frame-shift.later { border-color: #3f6670; color: #83c4d3; }
 .frame-pane img { display: block; width: 100%; aspect-ratio: 4 / 3; background: #000; object-fit: contain; }
+.boundary-slider { display: grid; gap: 9px; border: 1px solid #383b36; background: #191b19; margin-top: 12px; padding: 12px 14px; }
+.boundary-slider > span { color: #b7b9b2; font-size: 12px; }
+.boundary-slider > span b { color: #ff8b61; font: 700 10px ui-monospace, monospace; letter-spacing: .06em; text-transform: uppercase; }
+.boundary-slider input { width: 100%; accent-color: #ff6b35; cursor: ew-resize; }
+.boundary-slider input:disabled { cursor: wait; }
+.boundary-slider small { display: flex; justify-content: space-between; gap: 10px; color: #747870; font: 10px ui-monospace, monospace; }
+.boundary-slider small b { color: #ff8b61; font-weight: 700; }
 .step-controls { justify-content: center; margin-top: 12px; }
 .step-controls button { padding: 10px 14px; font: 12px ui-monospace, monospace; }
 .snap-tooltip { display: flex; justify-content: center; }

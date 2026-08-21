@@ -43,9 +43,9 @@ function withFreshAdjustmentBaseline(segment) {
   return withAdjustmentBaseline(rest)
 }
 
-function frameShift(segment, key) {
+function frameShift(segment, key, frameIndex = segment[key].frame_index) {
   const baseline = segment.adjustment_baseline?.[key] ?? segment[key].frame_index
-  const delta = segment[key].frame_index - baseline
+  const delta = frameIndex - baseline
   if (delta === 0) return { className: 'unchanged', label: 'No shift from proposal' }
   const count = Math.abs(delta)
   return {
@@ -134,10 +134,12 @@ function MatchReview({ job, onQueued }) {
   const [playing, setPlaying] = useState(false)
   const [playbackProgress, setPlaybackProgress] = useState(0)
   const [playheads, setPlayheads] = useState({ low: 0, reference: 0 })
+  const [boundaryDrafts, setBoundaryDrafts] = useState({ low: null, reference: null })
   const lowVideo = useRef(null)
   const referenceVideo = useRef(null)
   const sourceLowVideo = useRef(null)
   const sourceReferenceVideo = useRef(null)
+  const sliderCommits = useRef({})
 
   const load = useCallback(async () => {
     try {
@@ -154,6 +156,8 @@ function MatchReview({ job, onQueued }) {
   const segmentId = segment?.id
   const segmentLowStart = segment?.low_start.time_seconds
   const segmentReferenceStart = segment?.reference_start.time_seconds
+  const lowBoundaryFrame = segment?.[`low_${boundary}`]?.frame_index
+  const referenceBoundaryFrame = segment?.[`reference_${boundary}`]?.frame_index
 
   useEffect(() => {
     ;[lowVideo.current, referenceVideo.current].forEach((video) => video?.pause())
@@ -165,6 +169,11 @@ function MatchReview({ job, onQueued }) {
       if (referenceVideo.current) referenceVideo.current.currentTime = segmentReferenceStart
     }
   }, [selected, segmentId, segmentLowStart, segmentReferenceStart])
+
+  useEffect(() => {
+    setBoundaryDrafts({ low: lowBoundaryFrame ?? null, reference: referenceBoundaryFrame ?? null })
+    sliderCommits.current = {}
+  }, [selected, boundary, lowBoundaryFrame, referenceBoundaryFrame])
 
   useEffect(() => {
     if (!segment) return undefined
@@ -212,7 +221,7 @@ function MatchReview({ job, onQueued }) {
 
   function changedSegment(mutator) {
     const segments = review.segments.map((item, index) => index === selected ? mutator(item) : item)
-    persist(segments)
+    return persist(segments)
   }
 
   async function resolveSelected(status) {
@@ -236,6 +245,57 @@ function MatchReview({ job, onQueued }) {
       const next = Math.max(0, Math.min(info.frame_count - 1, based[key].frame_index + amount))
       return { ...based, [key]: { frame_index: next, pts: next, time_seconds: next / info.fps }, status: 'proposed', origin: 'manual' }
     })
+  }
+
+  function sliderRange(stream) {
+    const info = review.media[stream]
+    const start = segment[`${stream}_start`].frame_index
+    const end = segment[`${stream}_end`].frame_index
+    const baselineStart = segment.adjustment_baseline?.[`${stream}_start`] ?? start
+    const baselineEnd = segment.adjustment_baseline?.[`${stream}_end`] ?? end
+    const outsideFrames = Math.max(10, Math.round(info.fps))
+    return boundary === 'start'
+      ? { min: Math.max(0, Math.min(start, baselineStart - outsideFrames)), max: Math.max(start, end - 1) }
+      : { min: Math.min(end, start + 1), max: Math.min(info.frame_count - 1, Math.max(end, baselineEnd + outsideFrames)) }
+  }
+
+  function updateBoundarySliders(stream, nextFrame) {
+    const otherStream = stream === 'low' ? 'reference' : 'low'
+    const key = `${stream}_${boundary}`
+    const otherKey = `${otherStream}_${boundary}`
+    const deltaSeconds = (nextFrame - segment[key].frame_index) / review.media[stream].fps
+    const projectedOtherFrame = segment[otherKey].frame_index + Math.round(deltaSeconds * review.media[otherStream].fps)
+    const otherRange = sliderRange(otherStream)
+    const otherFrame = Math.max(otherRange.min, Math.min(otherRange.max, projectedOtherFrame))
+    setBoundaryDrafts((current) => ({ ...current, [stream]: nextFrame, [otherStream]: otherFrame }))
+  }
+
+  async function commitBoundarySliders() {
+    if (!segment || saving) return
+    const changes = ['low', 'reference'].filter((stream) => {
+      const next = boundaryDrafts[stream]
+      return next !== null && next !== segment[`${stream}_${boundary}`].frame_index
+    })
+    if (!changes.length) return
+    const commitKey = `${boundary}:${boundaryDrafts.low}:${boundaryDrafts.reference}`
+    if (sliderCommits.current[commitKey]) return
+    sliderCommits.current[commitKey] = true
+    const saved = await changedSegment((item) => {
+      let based = withAdjustmentBaseline(item)
+      for (const stream of changes) {
+        const key = `${stream}_${boundary}`
+        const next = boundaryDrafts[stream]
+        based = { ...based, [key]: { frame_index: next, pts: next, time_seconds: next / review.media[stream].fps } }
+      }
+      return { ...based, status: 'proposed', origin: 'manual' }
+    })
+    if (!saved) {
+      delete sliderCommits.current[commitKey]
+      setBoundaryDrafts({
+        low: segment[`low_${boundary}`].frame_index,
+        reference: segment[`reference_${boundary}`].frame_index,
+      })
+    }
   }
 
   useEffect(() => {
@@ -418,7 +478,7 @@ function MatchReview({ job, onQueued }) {
         </section>
         <section className="review-stage boundary-stage" aria-labelledby="match-frames-heading">
           <div className="stage-heading"><span>3</span><div><p className="eyebrow">MATCH EXACT FRAMES</p><h3 id="match-frames-heading">Align the first and last moments</h3></div></div>
-          <p className="stage-help">Choose a boundary, then move either clip until both images show the same instant. Every adjustment is saved to this segment.</p>
+          <p className="stage-help">Choose a boundary, then scrub either clip until both images show the same instant. The sliders move together by elapsed time while respecting each clip’s frame rate, and extend up to one second beyond the segment’s outer edge. Adjustments are saved when you release a slider.</p>
           <div className="boundary-tabs">
             <TooltipButton type="button" className={boundary === 'start' ? 'selected' : ''} aria-pressed={boundary === 'start'} onClick={() => showBoundary('start')} tooltip="Compare and adjust the first paired frame used by this match.">Start frames</TooltipButton>
             <TooltipButton type="button" className={boundary === 'end' ? 'selected' : ''} aria-pressed={boundary === 'end'} onClick={() => showBoundary('end')} tooltip="Compare and adjust the last paired frame used by this match.">End frames</TooltipButton>
@@ -426,14 +486,32 @@ function MatchReview({ job, onQueued }) {
           <div className="frame-compare">
           {['low', 'reference'].map((stream) => {
             const key = `${stream}_${boundary}`
-            const ref = segment[key]
-            const shift = frameShift(segment, key)
+            const frameIndex = boundaryDrafts[stream] ?? segment[key].frame_index
+            const ref = { frame_index: frameIndex, time_seconds: frameIndex / review.media[stream].fps }
+            const shift = frameShift(segment, key, frameIndex)
+            const range = sliderRange(stream)
             return <div className={`frame-pane pane-${stream}`} key={stream}>
               <div className="frame-pane-heading">
                 <span><b>{streamLabel[stream]}</b> · frame {ref.frame_index} · {formatTime(ref.time_seconds)}</span>
                 <strong className={`frame-shift ${shift.className}`} aria-live="polite">{shift.label}</strong>
               </div>
               <img src={imageUrl(stream, ref)} alt={`${stream} ${boundary} frame`} />
+              <label className="boundary-slider">
+                <span><b>Linked time</b> · Scrub {stream === 'low' ? 'supplemental' : 'reference'} {boundary} frame</span>
+                <input
+                  type="range"
+                  min={range.min}
+                  max={range.max}
+                  value={frameIndex}
+                  disabled={saving}
+                  aria-label={`Scrub ${stream === 'low' ? 'supplemental' : 'reference'} ${boundary} boundary frame`}
+                  onChange={(event) => updateBoundarySliders(stream, Number(event.target.value))}
+                  onPointerUp={commitBoundarySliders}
+                  onKeyUp={commitBoundarySliders}
+                  onBlur={commitBoundarySliders}
+                />
+                <small><span>Frame {range.min}</span><b>Frame {frameIndex}</b><span>Frame {range.max}</span></small>
+              </label>
               <div className="step-controls">{[-10, -1, 1, 10].map((amount) => <TooltipButton key={amount} type="button" disabled={saving} onClick={() => step(stream, amount)} tooltip={`Move the ${stream === 'low' ? 'supplemental' : 'reference'} ${boundary} boundary ${Math.abs(amount)} frame${Math.abs(amount) === 1 ? '' : 's'} ${amount < 0 ? 'earlier' : 'later'}.`}>{amount < 0 ? '←' : '→'} {Math.abs(amount)} frame{Math.abs(amount) === 1 ? '' : 's'}</TooltipButton>)}</div>
               <TooltipButton wrapperClassName="snap-tooltip" type="button" className="snap" disabled={saving} onClick={() => snap(stream)} tooltip={`Keep the other frame fixed and search nearby ${stream === 'low' ? 'supplemental' : 'reference'} frames for the closest visual match.`}>Find closest {stream === 'low' ? 'supplemental' : 'reference'} frame</TooltipButton>
             </div>

@@ -219,18 +219,28 @@ describe('App', () => {
     expect(screen.getByRole('tooltip', { name: /stack the playing reference/i })).toBeInTheDocument()
     expect(screen.getByText(/advanced segment editing/i).closest('details')).not.toHaveAttribute('open')
     expect(screen.getByText(/Unmatched and rejected footage is not deleted/i)).toBeInTheDocument()
-    fireEvent.click(screen.getAllByRole('button', { name: /→ 1 frame/i })[0])
-    expect(await screen.findByText('+1 frame later')).toBeInTheDocument()
-    expect(axios.put).toHaveBeenCalledWith(
+    const boundarySlider = screen.getByRole('slider', { name: /scrub supplemental start boundary frame/i })
+    expect(boundarySlider).toHaveAttribute('min', '0')
+    expect(boundarySlider).toHaveAttribute('max', '49')
+    expect(boundarySlider).toHaveValue('10')
+    fireEvent.change(boundarySlider, { target: { value: 7 } })
+    expect(screen.getByAltText(/low start frame/i).getAttribute('src')).toMatch(/\/frames\/low\/7$/)
+    expect(screen.getByAltText(/reference start frame/i).getAttribute('src')).toMatch(/\/frames\/reference\/6$/)
+    expect(screen.getByText('−3 frames earlier')).toBeInTheDocument()
+    expect(screen.getByText('−2 frames earlier')).toBeInTheDocument()
+    expect(axios.put).not.toHaveBeenCalled()
+    fireEvent.pointerUp(boundarySlider)
+    await waitFor(() => expect(axios.put).toHaveBeenCalledWith(
       expect.stringMatching(/match-review$/),
       expect.objectContaining({
         revision: 1,
         segments: [expect.objectContaining({
           adjustment_baseline: expect.objectContaining({ low_start: 10, reference_start: 8 }),
-          low_start: expect.objectContaining({ frame_index: 11 }),
+          low_start: expect.objectContaining({ frame_index: 7 }),
+          reference_start: expect.objectContaining({ frame_index: 6 }),
         })],
       }),
-    )
+    ))
     fireEvent.click(screen.getByRole('button', { name: /confirm frame match/i }))
 
     await waitFor(() => expect(axios.put).toHaveBeenCalledTimes(2))
