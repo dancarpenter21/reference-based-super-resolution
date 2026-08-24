@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import shutil
+import uuid
+from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
@@ -13,7 +15,9 @@ from app.services.job_store import store
 from app.services.gpu_diagnostics import gpu_diagnostics
 from app.services.job_worker import worker
 from ml_engine.config import PRESETS
-from ml_engine.alignment import frame_ref, validate_segments
+from ml_engine.alignment import (
+    alignment_summary, frame_ref, validate_alignment_spans, validate_segments,
+)
 from ml_engine.media import normalize_reference_frame, probe, read_frame
 
 router = APIRouter()
@@ -176,6 +180,173 @@ def save_match_review(job_id: str, payload: dict = Body(...)):
     return public_review(job_id, saved["review_data"], saved["review_revision"])
 
 
+def _plain_spans(review: dict) -> list[dict]:
+    return [
+        {key: deepcopy(value) for key, value in span.items() if not key.startswith("sequence_")}
+        for span in review.get("spans", [])
+    ]
+
+
+def _coalesce_differences(spans: list[dict]) -> list[dict]:
+    result: list[dict] = []
+    for span in spans:
+        if result and result[-1].get("kind") == span.get("kind") == "difference":
+            prior = result[-1]
+            for stream in ("low", "reference"):
+                key = f"{stream}_range"
+                left, right = prior.get(key), span.get(key)
+                if left and right:
+                    left["end_frame"] = right["end_frame"]
+                elif right:
+                    prior[key] = right
+            continue
+        result.append(span)
+    return result
+
+
+def _neighbor_with_range(spans: list[dict], index: int, stream: str, direction: int) -> int | None:
+    cursor = index + direction
+    while 0 <= cursor < len(spans):
+        if spans[cursor].get(f"{stream}_range"):
+            return cursor
+        cursor += direction
+    return None
+
+
+def _apply_v2_edit(review: dict, payload: dict, low_info, ref_info) -> dict:
+    spans = _plain_spans(review)
+    operation = payload.get("operation")
+    span_id = str(payload.get("span_id", ""))
+    index = next((i for i, span in enumerate(spans) if span["id"] == span_id), -1)
+    if index < 0:
+        raise ValueError("Alignment span was not found")
+    selected = spans[index]
+
+    if operation == "set_status":
+        if selected.get("kind") != "match" or payload.get("status") not in {"proposed", "confirmed"}:
+            raise ValueError("Only matched spans can be proposed or confirmed")
+        selected["status"] = payload["status"]
+    elif operation == "mark_unpaired":
+        if selected.get("kind") != "match":
+            raise ValueError("Only a matched span can be marked unpaired")
+        selected.update(kind="difference", status=None, confidence=None, origin="manual")
+        spans = _coalesce_differences(spans)
+    elif operation == "move_boundary":
+        if selected.get("kind") != "match" or payload.get("boundary") not in {"start", "end"}:
+            raise ValueError("Choose a start or end boundary on a matched span")
+        boundary = payload["boundary"]
+        for stream, info in (("low", low_info), ("reference", ref_info)):
+            next_frame = int(payload[f"{stream}_frame"])
+            current_range = selected[f"{stream}_range"]
+            if not 0 <= next_frame <= info.frame_count:
+                raise ValueError(f"The {stream} boundary is outside the video")
+            direction = -1 if boundary == "start" else 1
+            neighbor_index = _neighbor_with_range(spans, index, stream, direction)
+            if neighbor_index is None:
+                expected = 0 if boundary == "start" else info.frame_count
+                if next_frame != expected:
+                    raise ValueError(f"The outer {stream} boundary cannot move past the source edge")
+            else:
+                neighbor = spans[neighbor_index]
+                neighbor_range = neighbor[f"{stream}_range"]
+                if boundary == "start":
+                    neighbor_range["end_frame"] = next_frame
+                    current_range["start_frame"] = next_frame
+                else:
+                    current_range["end_frame"] = next_frame
+                    neighbor_range["start_frame"] = next_frame
+                if neighbor_range["start_frame"] == neighbor_range["end_frame"]:
+                    if neighbor.get("kind") == "match":
+                        raise ValueError("A boundary edit cannot erase an adjacent matched span")
+                    neighbor[f"{stream}_range"] = None
+                if neighbor.get("kind") == "match":
+                    neighbor["status"] = "proposed"
+        selected.update(status="proposed", origin="manual")
+        spans = [span for span in spans if span.get("low_range") or span.get("reference_range")]
+    elif operation == "split_match":
+        if selected.get("kind") != "match":
+            raise ValueError("Only a matched span can be split")
+        low_frame, ref_frame = int(payload["low_frame"]), int(payload["reference_frame"])
+        low, reference = selected["low_range"], selected["reference_range"]
+        if not (low["start_frame"] < low_frame < low["end_frame"] and reference["start_frame"] < ref_frame < reference["end_frame"]):
+            raise ValueError("Split frames must be inside the matched span")
+        left = {**selected, "id": str(uuid.uuid4()), "status": "proposed", "origin": "manual",
+                "low_range": {"start_frame": low["start_frame"], "end_frame": low_frame},
+                "reference_range": {"start_frame": reference["start_frame"], "end_frame": ref_frame}}
+        right = {**selected, "id": str(uuid.uuid4()), "status": "proposed", "origin": "manual",
+                 "low_range": {"start_frame": low_frame, "end_frame": low["end_frame"]},
+                 "reference_range": {"start_frame": ref_frame, "end_frame": reference["end_frame"]}}
+        spans[index:index + 1] = [left, right]
+    elif operation == "merge_next":
+        if selected.get("kind") != "match" or index + 1 >= len(spans) or spans[index + 1].get("kind") != "match":
+            raise ValueError("Only directly adjacent matched spans can be merged")
+        following = spans[index + 1]
+        selected.update(
+            id=str(uuid.uuid4()), status="proposed", origin="manual",
+            low_range={"start_frame": selected["low_range"]["start_frame"], "end_frame": following["low_range"]["end_frame"]},
+            reference_range={"start_frame": selected["reference_range"]["start_frame"], "end_frame": following["reference_range"]["end_frame"]},
+            confidence=min(float(selected.get("confidence", 1)), float(following.get("confidence", 1))),
+        )
+        spans.pop(index + 1)
+    elif operation == "create_match":
+        if selected.get("kind") != "difference" or not selected.get("low_range") or not selected.get("reference_range"):
+            raise ValueError("A match requires low and reference footage in the selected difference block")
+        low_start, low_end = int(payload["low_start"]), int(payload["low_end"])
+        ref_start, ref_end = int(payload["reference_start"]), int(payload["reference_end"])
+        low, reference = selected["low_range"], selected["reference_range"]
+        if not (low["start_frame"] <= low_start < low_end <= low["end_frame"] and reference["start_frame"] <= ref_start < ref_end <= reference["end_frame"]):
+            raise ValueError("The new match must stay inside the selected difference block")
+        replacements: list[dict] = []
+        before_low = {"start_frame": low["start_frame"], "end_frame": low_start} if low_start > low["start_frame"] else None
+        before_ref = {"start_frame": reference["start_frame"], "end_frame": ref_start} if ref_start > reference["start_frame"] else None
+        if before_low or before_ref:
+            replacements.append({"id": str(uuid.uuid4()), "kind": "difference", "low_range": before_low, "reference_range": before_ref, "origin": "manual", "status": None, "confidence": None})
+        replacements.append({"id": str(uuid.uuid4()), "kind": "match",
+                             "low_range": {"start_frame": low_start, "end_frame": low_end},
+                             "reference_range": {"start_frame": ref_start, "end_frame": ref_end},
+                             "origin": "manual", "status": "proposed", "confidence": 1.0})
+        after_low = {"start_frame": low_end, "end_frame": low["end_frame"]} if low_end < low["end_frame"] else None
+        after_ref = {"start_frame": ref_end, "end_frame": reference["end_frame"]} if ref_end < reference["end_frame"] else None
+        if after_low or after_ref:
+            replacements.append({"id": str(uuid.uuid4()), "kind": "difference", "low_range": after_low, "reference_range": after_ref, "origin": "manual", "status": None, "confidence": None})
+        spans[index:index + 1] = replacements
+    else:
+        raise ValueError("Unknown alignment edit operation")
+
+    spans = validate_alignment_spans(spans, low_info, ref_info)
+    return {**review, "spans": spans, "summary": alignment_summary(spans, low_info)}
+
+
+@router.patch("/jobs/{job_id}/match-review")
+def edit_match_review(job_id: str, payload: dict = Body(...)):
+    job = review_job(job_id)
+    review = job["review_data"]
+    if int(review.get("schema_version", 1)) != 2:
+        raise HTTPException(status_code=409, detail="This review uses the legacy segment editor")
+    low_info, ref_info = probe(job["low_path"]), probe(job["reference_path"])
+    try:
+        updated = _apply_v2_edit(review, payload, low_info, ref_info)
+        saved = store.save_review(job_id, updated, int(payload.get("revision", -1)))
+    except (KeyError, TypeError, ValueError) as error:
+        raise HTTPException(status_code=422, detail=str(error))
+    except RuntimeError as error:
+        raise HTTPException(status_code=409, detail=str(error))
+    return public_review(job_id, saved["review_data"], saved["review_revision"])
+
+
+@router.post("/jobs/{job_id}/match-review/reanalyze", status_code=202)
+def reanalyze_match_review(job_id: str, payload: dict = Body(...)):
+    job = review_job(job_id)
+    if payload.get("confirm_discard") is not True:
+        raise HTTPException(status_code=422, detail="confirm_discard must be true")
+    try:
+        updated = store.reanalyze_review(job_id, int(payload.get("revision", -1)))
+    except RuntimeError as error:
+        raise HTTPException(status_code=409, detail=str(error))
+    worker.notify()
+    return public_job(updated)
+
+
 @router.post("/jobs/{job_id}/match-review/expand")
 def expand_match_seed(job_id: str, payload: dict = Body(...)):
     job = review_job(job_id)
@@ -240,13 +411,27 @@ def approve_match_review(job_id: str, payload: dict = Body(...)):
     mode = payload.get("mode")
     if mode not in {"paired", "unpaired"}:
         raise HTTPException(status_code=422, detail="mode must be paired or unpaired")
-    segments = job["review_data"].get("segments", [])
-    if any(s.get("status") == "proposed" for s in segments):
+    review = job["review_data"]
+    schema_version = int(review.get("schema_version", 1))
+    segments = review.get("segments", [])
+    spans = review.get("spans", [])
+    if schema_version == 2 and any(
+        span.get("kind") == "match" and span.get("status") == "proposed" for span in spans
+    ):
+        raise HTTPException(status_code=422, detail="Confirm or mark every proposed match as unpaired first")
+    if schema_version == 1 and any(s.get("status") == "proposed" for s in segments):
         raise HTTPException(status_code=422, detail="Confirm or reject every proposed segment first")
     try:
-        confirmed = validate_segments(segments, probe(job["low_path"]), probe(job["reference_path"]))
-        if mode == "paired" and not confirmed:
-            raise ValueError("Confirm at least one segment or continue unpaired")
+        low_info, ref_info = probe(job["low_path"]), probe(job["reference_path"])
+        if schema_version == 2:
+            validated = validate_alignment_spans(spans, low_info, ref_info)
+            confirmed_count = sum(
+                span.get("kind") == "match" and span.get("status") == "confirmed" for span in validated
+            )
+        else:
+            confirmed_count = len(validate_segments(segments, low_info, ref_info))
+        if mode == "paired" and not confirmed_count:
+            raise ValueError("Confirm at least one match or continue unpaired")
         updated = store.approve_review(job_id, mode, int(payload.get("revision", -1)))
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error))

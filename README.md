@@ -2,23 +2,23 @@
 
 A local, single-GPU application that learns a conservative, video-specific upscaler from two overlapping versions of the same video: a high-resolution reference and a low-resolution supplement. Either input may contain footage the other does not.
 
-The application proposes chronological overlap segments, then pauses for frame-match review before it starts GPU training. Different constant frame rates are handled with independent frame indices and per-segment timestamp mappings rather than one global offset. It never silently treats an automatic proposal as ground truth.
+The application builds a unified edit-sequence alignment, then pauses for frame-match review before it starts GPU training. Different constant frame rates are handled with independent frame indices and per-block mappings rather than one global offset. It never silently treats an automatic proposal as ground truth.
 
 ## Current workflow
 
 1. Upload the low-resolution supplement and the high-resolution reference. Neither input is assumed to be complete.
 2. Choose **Find and match shared frames** (recommended) or **Skip matching · reference only**.
-3. Guided jobs probe both streams, create lightweight navigation proxies, and propose same-order shared sections with gaps. Reference-only jobs skip this work and go directly to unpaired adaptation.
-4. For guided jobs, review every proposed section in the browser. Confirm or adjust its exact start/end frame pairs, reject it, or add a missing section from the two playheads.
+3. Guided jobs probe both streams, create lightweight navigation proxies, and build an ordered map of shared and source-only footage. Reference-only jobs skip this work and go directly to unpaired adaptation.
+4. For guided jobs, use the full-program overview and zoomed detail timeline to confirm contiguous shared blocks, inspect any corresponding frame pair, correct cuts, split blocks, or mark footage unpaired.
 5. Fine-tune a pretrained RealESRGAN ×2 RRDB model without a GAN discriminator.
 6. Upscale the supplemental stream to 640×480 (4:3), stabilize residual detail across frames, and restore its original audio.
 7. Preview/download the MP4 and its JSON processing report, including the selected matching workflow.
 
-Review jobs survive browser and backend restarts and do not occupy the GPU queue. The review workspace walks through three stages: choose a shared section, compare its motion, then align and approve its exact boundary frames. Segment playback uses linked play/pause and proportional seeking, defaults to side-by-side video, and can play the two sources stacked with adjustable reference opacity. Live timecodes and frame estimates remain visible while the clips play; ongoing drift correction stays manual so the reviewer remains in control.
+Review jobs survive browser and backend restarts and do not occupy the GPU queue. New reviews show both sources on one edit-sequence axis: vertically aligned solid blocks are proposed or confirmed matches, while hatched difference blocks expose a reference-only intro, a supplemental-only tail, or unrelated footage between the same shared sections. A draggable overview window controls a zoomed detail track. Selecting a matched block opens exact corresponding frames side by side or overlaid with adjustable opacity.
 
-Exact boundary review reports how far each clip’s selected boundary has moved from its original proposal. Linked frame scrubbers preview the whole segment, convert movement through each clip’s own frame rate, extend up to one second beyond the outer boundary, and save both positions together on release. The same view provides descriptive hover/focus tooltips, independent earlier/later frame controls for final correction, nearby-frame matching, and keyboard stepping (left/right for the supplement, down/up for the reference; hold Shift for ten frames). Less-common full-source navigation, missing-match creation, splitting, and merging live under **Advanced segment editing** so they remain available without crowding the normal confirmation path.
+The frame inspector maps every supplemental frame in a matched block to the nearest reference frame at the same relative position. It provides independent earlier/later controls, nearby-frame matching, and keyboard stepping (left/right for the supplement, down/up for the reference; hold Shift for ten frames). Cut edits are revision-checked and validated as a complete source partition, so a start cannot cross an end and blocks cannot overlap. Existing sparse-review jobs remain available in the legacy editor and can be explicitly rebuilt with the unified matcher.
 
-Confirmed segments describe shared footage used for paired training. Rejecting a segment rejects only that training relationship; it does not delete footage. Uncolored timeline ranges make footage that appears in only one input visible during review.
+Confirmed blocks produce a dense manifest containing every eligible supplemental frame; difference blocks never produce training pairs. Marking a block unpaired changes only that training relationship and never deletes source footage.
 
 The current renderer follows the supplemental video's timeline. The coverage review now exposes high-resolution-only material instead of hiding it behind a “complete source” assumption, but assembling mutually exclusive ranges from both inputs into one ordered output requires an explicit edit/ordering plan and is not yet performed automatically.
 

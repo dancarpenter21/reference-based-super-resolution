@@ -153,3 +153,72 @@ def test_match_review_save_frame_and_approve(client, tmp_path, monkeypatch):
 def probe_dict(path):
     from ml_engine.media import probe
     return probe(path).to_dict()
+
+
+def test_v2_alignment_edit_validation_and_approval(client, tmp_path, monkeypatch):
+    def make_video(path):
+        writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), 10, (80, 60))
+        for index in range(30):
+            writer.write(np.full((60, 80, 3), index * 4, np.uint8))
+        writer.release()
+
+    low, reference = tmp_path / "v2-low.mp4", tmp_path / "v2-reference.mp4"
+    make_video(low)
+    make_video(reference)
+    jobs = JobStore(tmp_path / "v2.sqlite3")
+    job = jobs.create(str(low), str(reference), str(tmp_path / "v2-job"), "quick")
+    review = {
+        "schema_version": 2, "revision": 1,
+        "spans": [
+            {"id": "before", "kind": "difference", "low_range": {"start_frame": 0, "end_frame": 5}, "reference_range": {"start_frame": 0, "end_frame": 5}, "origin": "automatic", "status": None, "confidence": None},
+            {"id": "shared", "kind": "match", "low_range": {"start_frame": 5, "end_frame": 20}, "reference_range": {"start_frame": 5, "end_frame": 20}, "origin": "automatic", "status": "proposed", "confidence": .95},
+            {"id": "after", "kind": "difference", "low_range": {"start_frame": 20, "end_frame": 30}, "reference_range": {"start_frame": 20, "end_frame": 30}, "origin": "automatic", "status": None, "confidence": None},
+        ],
+        "media": {"low": probe_dict(low), "reference": probe_dict(reference)},
+        "summary": {"proposed_blocks": 1, "confirmed_blocks": 0, "matched_seconds": 0},
+    }
+    jobs.update(job["id"], state="awaiting_match_review", stage="awaiting_match_review", phase="review", review_data=review, review_revision=1)
+    monkeypatch.setattr(endpoints, "store", jobs)
+    monkeypatch.setattr(endpoints.worker, "notify", lambda: None)
+
+    invalid = client.patch(f"/api/v1/jobs/{job['id']}/match-review", json={
+        "revision": 1, "span_id": "shared", "operation": "move_boundary", "boundary": "start",
+        "low_frame": 20, "reference_frame": 20,
+    })
+    assert invalid.status_code == 422
+
+    moved = client.patch(f"/api/v1/jobs/{job['id']}/match-review", json={
+        "revision": 1, "span_id": "shared", "operation": "move_boundary", "boundary": "start",
+        "low_frame": 6, "reference_frame": 6,
+    })
+    assert moved.status_code == 200
+    assert moved.json()["spans"][0]["low_range"]["end_frame"] == 6
+    assert moved.json()["spans"][1]["low_range"]["start_frame"] == 6
+
+    confirmed = client.patch(f"/api/v1/jobs/{job['id']}/match-review", json={
+        "revision": moved.json()["revision"], "span_id": "shared", "operation": "set_status", "status": "confirmed",
+    })
+    assert confirmed.status_code == 200
+    approved = client.post(f"/api/v1/jobs/{job['id']}/match-review/approve", json={
+        "revision": confirmed.json()["revision"], "mode": "paired",
+    })
+    assert approved.status_code == 202
+    assert jobs.get(job["id"])["phase"] == "processing"
+
+
+def test_review_reanalysis_requires_explicit_discard_confirmation(client, tmp_path, monkeypatch):
+    jobs = JobStore(tmp_path / "reanalyze.sqlite3")
+    job = jobs.create("low.mp4", "reference.mp4", str(tmp_path / "reanalyze-job"), "quick")
+    review = {"revision": 4, "segments": [], "summary": {"proposed_segments": 0}}
+    jobs.update(job["id"], state="awaiting_match_review", stage="awaiting_match_review", phase="review", review_data=review, review_revision=4)
+    monkeypatch.setattr(endpoints, "store", jobs)
+    monkeypatch.setattr(endpoints.worker, "notify", lambda: None)
+
+    refused = client.post(f"/api/v1/jobs/{job['id']}/match-review/reanalyze", json={"revision": 4})
+    accepted = client.post(f"/api/v1/jobs/{job['id']}/match-review/reanalyze", json={"revision": 4, "confirm_discard": True})
+
+    assert refused.status_code == 422
+    assert accepted.status_code == 202
+    rebuilt = jobs.get(job["id"])
+    assert rebuilt["state"] == "queued" and rebuilt["phase"] == "analysis"
+    assert rebuilt["review_data"] is None

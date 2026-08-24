@@ -102,7 +102,7 @@ class ReferenceVideoDataset(Dataset):
         lo, hi = (split, self.frame_count) if self.validation else (0, max(1, split))
         use_paired = bool(self.paired_manifest) and rng.random() < 0.5
         if use_paired:
-            pair_position = index % len(self.paired_manifest)
+            pair_position = rng.randrange(len(self.paired_manifest))
             pair = self.paired_manifest[pair_position]
             ref_index = int(pair["reference_frame"])
             low_index = int(pair["low_frame"])

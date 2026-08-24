@@ -70,14 +70,20 @@ def train_model(
     output_dir.mkdir(parents=True, exist_ok=True)
     model = model_factory().to(device)
     load_weights(model, pretrained_path, strict=True)
+    all_pairs = paired_manifest or []
+    validation_pairs = all_pairs[::10]
+    validation_keys = {(pair["low_frame"], pair["reference_frame"]) for pair in validation_pairs}
+    training_pairs = [
+        pair for pair in all_pairs
+        if (pair["low_frame"], pair["reference_frame"]) not in validation_keys
+    ]
     train_set = ReferenceVideoDataset(
         reference_path,
         low_path,
         preset.patch_size,
         preset.max_steps * preset.batch_size,
-        paired_manifest=paired_manifest,
+        paired_manifest=training_pairs,
     )
-    validation_pairs = (paired_manifest or [])[::10]
     val_set = ReferenceVideoDataset(
         reference_path, low_path, preset.patch_size, 12, validation=True,
         paired_manifest=validation_pairs,

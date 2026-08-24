@@ -37,3 +37,34 @@ def test_reference_only_processing_writes_complete_reports_without_review_artifa
     assert not (tmp_path / "job" / "low-proxy.mp4").exists()
     assert (tmp_path / "job" / "media.json").is_file()
     assert (tmp_path / "job" / "report.json").is_file()
+
+
+def test_v2_processing_passes_every_confirmed_low_frame_to_training(tmp_path, monkeypatch):
+    low, reference = tmp_path / "low.mp4", tmp_path / "reference.mp4"
+    make_video(low)
+    make_video(reference)
+    captured = {}
+    monkeypatch.setattr(pipeline, "ensure_pretrained", lambda: tmp_path / "pretrained.pth")
+
+    def train(*args, **kwargs):
+        captured["pairs"] = kwargs["paired_manifest"]
+        return tmp_path / "checkpoint.pth", {"selected": "fine_tuned"}
+
+    monkeypatch.setattr(pipeline, "train_model", train)
+    monkeypatch.setattr(pipeline, "upscale_video", lambda *args, **kwargs: {"frames": 20})
+    review = {
+        "schema_version": 2, "revision": 3, "approved_mode": "paired", "matching_mode": "guided",
+        "spans": [
+            {"id": "intro", "kind": "difference", "low_range": None, "reference_range": {"start_frame": 0, "end_frame": 5}, "status": None},
+            {"id": "shared", "kind": "match", "low_range": {"start_frame": 0, "end_frame": 15}, "reference_range": {"start_frame": 5, "end_frame": 20}, "status": "confirmed", "confidence": .9},
+            {"id": "tail", "kind": "difference", "low_range": {"start_frame": 15, "end_frame": 20}, "reference_range": None, "status": None},
+        ],
+    }
+
+    report = pipeline.process_pipeline(low, reference, tmp_path / "v2-job", "quick", review)
+
+    assert report["alignment"]["mode"] == "paired"
+    assert report["alignment"]["pair_count"] == 15
+    assert [pair["low_frame"] for pair in captured["pairs"]] == list(range(15))
+    assert captured["pairs"][0]["reference_frame"] == 5
+    assert captured["pairs"][-1]["reference_frame"] == 19

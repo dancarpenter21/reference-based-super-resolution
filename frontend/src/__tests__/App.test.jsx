@@ -246,4 +246,52 @@ describe('App', () => {
     await waitFor(() => expect(axios.put).toHaveBeenCalledTimes(2))
     expect(await screen.findByRole('button', { name: /use confirmed pairs/i })).toBeEnabled()
   })
+
+  it('shows a unified sequence with explicit one-sided footage and dense frame navigation', async () => {
+    const reviewJob = {
+      ...activeJob, id: 'unified-job', state: 'awaiting_match_review', stage: 'awaiting_match_review', progress: .07,
+      message: 'Review proposed frame matches', needs_review: true, matching_mode: 'guided',
+    }
+    const spans = [
+      { id: 'intro', kind: 'difference', low_range: null, reference_range: { start_frame: 0, end_frame: 20 }, status: null, confidence: null, origin: 'automatic', sequence_start_seconds: 0, sequence_duration_seconds: 2 },
+      { id: 'shared', kind: 'match', low_range: { start_frame: 0, end_frame: 40 }, reference_range: { start_frame: 20, end_frame: 60 }, status: 'proposed', confidence: .96, origin: 'automatic', sequence_start_seconds: 2, sequence_duration_seconds: 4 },
+      { id: 'tail', kind: 'difference', low_range: { start_frame: 40, end_frame: 60 }, reference_range: null, status: null, confidence: null, origin: 'automatic', sequence_start_seconds: 6, sequence_duration_seconds: 2 },
+    ]
+    const review = {
+      schema_version: 2, revision: 1, spans,
+      summary: { proposed_blocks: 1, confirmed_blocks: 0, difference_blocks: 2, matched_seconds: 0 },
+      media: { low: { fps: 10, frame_count: 60, duration: 6 }, reference: { fps: 10, frame_count: 60, duration: 6 } },
+      proxy_urls: { low: '/low.mp4', reference: '/reference.mp4' },
+    }
+    axios.get.mockImplementation((url) => {
+      if (url.endsWith('/system/status')) return Promise.resolve({ data: systemStatus })
+      if (url.endsWith('/match-review')) return Promise.resolve({ data: review })
+      return Promise.resolve({ data: { jobs: [reviewJob] } })
+    })
+    axios.patch.mockImplementation((_, payload) => Promise.resolve({ data: {
+      ...review, revision: 2,
+      spans: spans.map((span) => span.id === payload.span_id ? { ...span, status: 'confirmed' } : span),
+      summary: { ...review.summary, proposed_blocks: 0, confirmed_blocks: 1, matched_seconds: 4 },
+    } }))
+
+    render(<App />)
+
+    expect(await screen.findByText(/one sequence, two source tracks/i)).toBeInTheDocument()
+    expect(screen.getAllByRole('button', { name: /unpaired reference block, frames 0 through 19/i }).length).toBeGreaterThan(0)
+    expect(screen.getAllByRole('button', { name: /unpaired low block, frames 40 through 59/i }).length).toBeGreaterThan(0)
+    expect(screen.getByAltText(/supplemental.*frame 0/i)).toBeInTheDocument()
+    expect(screen.getByAltText(/reference.*frame 20/i)).toBeInTheDocument()
+
+    fireEvent.change(screen.getByRole('slider', { name: /matched frame position/i }), { target: { value: 500 } })
+    expect(screen.getByAltText(/supplemental.*frame 20/i)).toBeInTheDocument()
+    expect(screen.getByAltText(/reference.*frame 40/i)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /use dense confirmed pairs/i })).toBeDisabled()
+
+    fireEvent.click(screen.getByRole('button', { name: /confirm matched block/i }))
+    await waitFor(() => expect(axios.patch).toHaveBeenCalledWith(
+      expect.stringMatching(/match-review$/),
+      expect.objectContaining({ revision: 1, span_id: 'shared', operation: 'set_status', status: 'confirmed' }),
+    ))
+    expect(await screen.findByRole('button', { name: /use dense confirmed pairs/i })).toBeEnabled()
+  })
 })

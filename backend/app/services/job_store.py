@@ -199,6 +199,18 @@ class JobStore:
             warning=None, progress=0.07,
         )
 
+    def reanalyze_review(self, job_id: str, expected_revision: int) -> dict:
+        job = self.get(job_id)
+        if job["state"] != "awaiting_match_review":
+            raise RuntimeError("Only a job awaiting frame-match review can be reanalyzed")
+        if expected_revision != job["review_revision"]:
+            raise RuntimeError("Frame-match review changed; reload before rebuilding it")
+        return self.update(
+            job_id, state="queued", stage="queued", phase="analysis", progress=0.0,
+            message="Queued to rebuild frame alignment", review_data=None,
+            review_revision=0, alignment_mode=None, warning=None, error=None,
+        )
+
     def cancel(self, job_id: str) -> dict:
         job = self.get(job_id)
         if job["state"] in TERMINAL_STATES:

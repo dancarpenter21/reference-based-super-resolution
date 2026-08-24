@@ -5,7 +5,8 @@ from collections.abc import Callable
 from pathlib import Path
 
 from .alignment import (
-    AlignmentReport, analyze_alignment, build_pair_manifest, segment_from_dict, validate_segments,
+    AlignmentReport, analyze_alignment, build_dense_pair_manifest, build_pair_manifest,
+    segment_from_dict, validate_alignment_spans, validate_segments,
 )
 from .inference.inference import upscale_video
 from .media import create_navigation_proxy, probe, validate_input, write_json
@@ -76,11 +77,23 @@ def process_pipeline(
     media_report = {"low": low_info.to_dict(), "reference": ref_info.to_dict()}
     write_json(job_dir / "media.json", media_report)
     mode = review.get("approved_mode", "paired")
-    segments = validate_segments(review.get("segments", []), low_info, ref_info) if mode == "paired" else []
-    manifest = build_pair_manifest(segments, low_info, ref_info)
+    schema_version = int(review.get("schema_version", 1))
+    if mode == "paired" and schema_version == 2:
+        spans = validate_alignment_spans(review.get("spans", []), low_info, ref_info)
+        manifest = build_dense_pair_manifest(spans, low_info, ref_info)
+        confirmed_spans = [span for span in spans if span.get("kind") == "match" and span.get("status") == "confirmed"]
+        confidence = sum(float(span.get("confidence", 1.0)) for span in confirmed_spans) / len(confirmed_spans) if confirmed_spans else 0.0
+        verified = sum(
+            (span["low_range"]["end_frame"] - span["low_range"]["start_frame"]) / low_info.fps
+            for span in confirmed_spans
+        )
+        segments = []
+    else:
+        segments = validate_segments(review.get("segments", []), low_info, ref_info) if mode == "paired" else []
+        manifest = build_pair_manifest(segments, low_info, ref_info)
+        confidence = sum(s.confidence for s in segments) / len(segments) if segments else 0.0
+        verified = sum(s.low_end.time_seconds - s.low_start.time_seconds for s in segments)
     write_json(job_dir / "pair-manifest.json", {"pairs": manifest})
-    confidence = sum(s.confidence for s in segments) / len(segments) if segments else 0.0
-    verified = sum(s.low_end.time_seconds - s.low_start.time_seconds for s in segments)
     alignment = AlignmentReport(
         mode="paired" if manifest else "unpaired", confidence=confidence,
         verified_seconds=verified, anchors=(), segments=tuple(segments), pair_count=len(manifest),
@@ -109,7 +122,11 @@ def process_pipeline(
     report = {
         "media": media_report, "alignment": alignment.to_dict(),
         "matching_mode": review.get("matching_mode", "guided"),
-        "review": {"revision": review.get("revision"), "approved_mode": mode, "segments": review.get("segments", [])},
+        "review": {
+            "schema_version": schema_version, "revision": review.get("revision"), "approved_mode": mode,
+            "spans": review.get("spans", []) if schema_version == 2 else None,
+            "segments": review.get("segments", []) if schema_version == 1 else None,
+        },
         "training": training, "inference": inference, "output": str(output),
     }
     write_json(job_dir / "report.json", report)

@@ -40,6 +40,31 @@ class MatchSegment:
 
 
 @dataclass(frozen=True)
+class FrameRange:
+    """A half-open CFR frame range: start_frame is included, end_frame is not."""
+
+    start_frame: int
+    end_frame: int
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class AlignmentSpan:
+    id: str
+    kind: str
+    low_range: FrameRange | None
+    reference_range: FrameRange | None
+    confidence: float | None = None
+    origin: str = "automatic"
+    status: str | None = None
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
 class AlignmentReport:
     mode: str
     confidence: float
@@ -111,6 +136,44 @@ def _monotonic(candidates: list[Anchor]) -> list[Anchor]:
     return list(reversed(result))
 
 
+def _sequence_pairs(similarities: np.ndarray, gap_penalty: float = 0.08) -> list[tuple[int, int]]:
+    """Global ordered alignment with explicit gaps on either source timeline."""
+    low_count, ref_count = similarities.shape
+    scores = np.empty((low_count + 1, ref_count + 1), dtype=np.float32)
+    trace = np.zeros((low_count + 1, ref_count + 1), dtype=np.uint8)
+    scores[:, 0] = -gap_penalty * np.arange(low_count + 1)
+    scores[0, :] = -gap_penalty * np.arange(ref_count + 1)
+    trace[1:, 0] = 1  # skip low sample
+    trace[0, 1:] = 2  # skip reference sample
+    for low_index in range(1, low_count + 1):
+        for ref_index in range(1, ref_count + 1):
+            # Scores above ~0.68 are useful evidence; weaker comparisons are
+            # cheaper to skip than to force into a correspondence.
+            match_reward = (float(similarities[low_index - 1, ref_index - 1]) - 0.68) * 4.0
+            choices = (
+                scores[low_index - 1, ref_index - 1] + match_reward,
+                scores[low_index - 1, ref_index] - gap_penalty,
+                scores[low_index, ref_index - 1] - gap_penalty,
+            )
+            direction = int(np.argmax(choices))
+            scores[low_index, ref_index] = choices[direction]
+            trace[low_index, ref_index] = direction
+    low_index, ref_index = low_count, ref_count
+    pairs: list[tuple[int, int]] = []
+    while low_index or ref_index:
+        direction = int(trace[low_index, ref_index])
+        if direction == 0:
+            low_index -= 1
+            ref_index -= 1
+            if similarities[low_index, ref_index] >= 0.68:
+                pairs.append((low_index, ref_index))
+        elif direction == 1:
+            low_index -= 1
+        else:
+            ref_index -= 1
+    return list(reversed(pairs))
+
+
 def _segments_from_anchors(
     anchors: list[Anchor], low_info: MediaInfo, reference_info: MediaInfo, sample_seconds: float
 ) -> list[MatchSegment]:
@@ -121,13 +184,14 @@ def _segments_from_anchors(
             prior = current[-1]
             low_delta = anchor.low_time - prior.low_time
             ref_delta = anchor.reference_time - prior.reference_time
-            initial_offset = current[0].reference_time - current[0].low_time
+            offsets = [item.reference_time - item.low_time for item in current]
+            expected_offset = float(np.median(offsets))
             current_offset = anchor.reference_time - anchor.low_time
-            # Within one retained section, elapsed playback time must advance together.
+            # Missing confidence samples do not imply an edit. Split only when the
+            # two source clocks actually diverge or their persistent offset changes.
             if (
-                low_delta > sample_seconds * 4 or ref_delta > sample_seconds * 4
-                or abs(low_delta - ref_delta) > sample_seconds * 1.5
-                or abs(current_offset - initial_offset) > 0.25
+                abs(low_delta - ref_delta) > sample_seconds * 1.5
+                or abs(current_offset - expected_offset) > sample_seconds * 1.5
             ):
                 if len(current) >= 2:
                     groups.append(current)
@@ -139,9 +203,9 @@ def _segments_from_anchors(
     segments: list[MatchSegment] = []
     for group in groups:
         low_start = round(group[0].low_time * low_info.fps)
-        low_end = round(group[-1].low_time * low_info.fps)
+        low_end = round((group[-1].low_time + sample_seconds) * low_info.fps) - 1
         ref_start = round(group[0].reference_time * reference_info.fps)
-        ref_end = round(group[-1].reference_time * reference_info.fps)
+        ref_end = round((group[-1].reference_time + sample_seconds) * reference_info.fps) - 1
         if low_end <= low_start or ref_end <= ref_start:
             continue
         segments.append(MatchSegment(
@@ -155,6 +219,146 @@ def _segments_from_anchors(
     return segments
 
 
+def _frame_range(start: int, end: int) -> FrameRange | None:
+    return FrameRange(int(start), int(end)) if end > start else None
+
+
+def _range_seconds(value: FrameRange | None, info: MediaInfo) -> float:
+    return 0.0 if value is None else (value.end_frame - value.start_frame) / info.fps
+
+
+def _decorate_timeline(spans: list[dict], low_info: MediaInfo, reference_info: MediaInfo) -> list[dict]:
+    cursor = 0.0
+    result: list[dict] = []
+    for span in spans:
+        low = FrameRange(**span["low_range"]) if span.get("low_range") else None
+        reference = FrameRange(**span["reference_range"]) if span.get("reference_range") else None
+        duration = max(_range_seconds(low, low_info), _range_seconds(reference, reference_info))
+        result.append({**span, "sequence_start_seconds": cursor, "sequence_duration_seconds": duration})
+        cursor += duration
+    return result
+
+
+def spans_from_segments(
+    segments: list[MatchSegment], low_info: MediaInfo, reference_info: MediaInfo,
+) -> list[dict]:
+    """Turn sparse match islands into a complete ordered partition of both sources."""
+    spans: list[dict] = []
+    low_cursor = reference_cursor = 0
+    for segment in sorted(segments, key=lambda item: item.low_start.frame_index):
+        low_start = segment.low_start.frame_index
+        reference_start = segment.reference_start.frame_index
+        gap_low = _frame_range(low_cursor, low_start)
+        gap_reference = _frame_range(reference_cursor, reference_start)
+        if gap_low or gap_reference:
+            spans.append(AlignmentSpan(
+                str(uuid4()), "difference", gap_low, gap_reference, origin="automatic",
+            ).to_dict())
+        # Anchor endpoints are matching frames, so make the stored range half-open.
+        low_end = min(low_info.frame_count, segment.low_end.frame_index + 1)
+        reference_end = min(reference_info.frame_count, segment.reference_end.frame_index + 1)
+        spans.append(AlignmentSpan(
+            segment.id, "match", FrameRange(low_start, low_end),
+            FrameRange(reference_start, reference_end), segment.confidence,
+            segment.origin, segment.status,
+        ).to_dict())
+        low_cursor, reference_cursor = low_end, reference_end
+    tail_low = _frame_range(low_cursor, low_info.frame_count)
+    tail_reference = _frame_range(reference_cursor, reference_info.frame_count)
+    if tail_low or tail_reference:
+        spans.append(AlignmentSpan(
+            str(uuid4()), "difference", tail_low, tail_reference, origin="automatic",
+        ).to_dict())
+    if not spans:
+        spans.append(AlignmentSpan(
+            str(uuid4()), "difference", FrameRange(0, low_info.frame_count),
+            FrameRange(0, reference_info.frame_count), origin="automatic",
+        ).to_dict())
+    return _decorate_timeline(spans, low_info, reference_info)
+
+
+def alignment_summary(spans: list[dict], low_info: MediaInfo) -> dict:
+    matches = [span for span in spans if span.get("kind") == "match"]
+    confirmed = [span for span in matches if span.get("status") == "confirmed"]
+    matched_frames = sum(
+        span["low_range"]["end_frame"] - span["low_range"]["start_frame"] for span in confirmed
+    )
+    return {
+        "proposed_blocks": sum(span.get("status") == "proposed" for span in matches),
+        "confirmed_blocks": len(confirmed),
+        "difference_blocks": sum(span.get("kind") == "difference" for span in spans),
+        "matched_frames": matched_frames,
+        "matched_seconds": matched_frames / low_info.fps,
+        "warning": None if matches else "No reliable shared section was proposed. Add one manually or continue unpaired.",
+    }
+
+
+def validate_alignment_spans(
+    spans: list[dict], low_info: MediaInfo, reference_info: MediaInfo,
+) -> list[dict]:
+    if not isinstance(spans, list) or not spans:
+        raise ValueError("Alignment must contain at least one span")
+    cursors = {"low": 0, "reference": 0}
+    counts = {"low": low_info.frame_count, "reference": reference_info.frame_count}
+    seen: set[str] = set()
+    for span in spans:
+        span_id = str(span.get("id", ""))
+        if not span_id or span_id in seen:
+            raise ValueError("Every alignment span must have a unique id")
+        seen.add(span_id)
+        kind = span.get("kind")
+        if kind not in {"match", "difference"}:
+            raise ValueError(f"Span {span_id} has an unknown kind")
+        present = 0
+        for stream in ("low", "reference"):
+            value = span.get(f"{stream}_range")
+            if value is None:
+                continue
+            present += 1
+            try:
+                start, end = int(value["start_frame"]), int(value["end_frame"])
+            except (KeyError, TypeError, ValueError):
+                raise ValueError(f"Span {span_id} has an invalid {stream} range")
+            if start != cursors[stream] or not (0 <= start < end <= counts[stream]):
+                raise ValueError(f"Span {span_id} breaks the {stream} timeline partition")
+            cursors[stream] = end
+        if kind == "match":
+            if present != 2 or span.get("status") not in {"proposed", "confirmed"}:
+                raise ValueError(f"Matched span {span_id} requires both ranges and a valid status")
+            if span.get("status") == "confirmed":
+                low_range, ref_range = span["low_range"], span["reference_range"]
+                low_duration = (low_range["end_frame"] - low_range["start_frame"]) / low_info.fps
+                ref_duration = (ref_range["end_frame"] - ref_range["start_frame"]) / reference_info.fps
+                if abs(low_duration - ref_duration) > max(0.25, min(low_duration, ref_duration) * 0.03):
+                    raise ValueError(f"Matched span {span_id} durations disagree; split or adjust its cuts")
+        elif not present:
+            raise ValueError(f"Difference span {span_id} does not contain footage")
+    for stream in ("low", "reference"):
+        if cursors[stream] != counts[stream]:
+            raise ValueError(f"Alignment does not cover the complete {stream} video")
+    return _decorate_timeline(spans, low_info, reference_info)
+
+
+def build_dense_pair_manifest(spans: list[dict], low_info: MediaInfo, reference_info: MediaInfo) -> list[dict]:
+    pairs: list[dict] = []
+    for span in spans:
+        if span.get("kind") != "match" or span.get("status") != "confirmed":
+            continue
+        low, reference = span["low_range"], span["reference_range"]
+        low_count = low["end_frame"] - low["start_frame"]
+        ref_count = reference["end_frame"] - reference["start_frame"]
+        for offset in range(low_count):
+            position = offset / max(1, low_count - 1)
+            ref_offset = round(position * max(0, ref_count - 1))
+            pairs.append({
+                "span_id": span["id"], "segment_id": span["id"],
+                "low_frame": low["start_frame"] + offset,
+                "reference_frame": reference["start_frame"] + ref_offset,
+                "confidence": float(span.get("confidence", 1.0)),
+            })
+    return pairs
+
+
 def analyze_alignment(
     low_path: str | Path,
     reference_path: str | Path,
@@ -166,8 +370,9 @@ def analyze_alignment(
     low_samples = list(sampled_frames(low_path, sample_seconds))
     ref_samples = [(t, normalize_reference_frame(f, reference_info)) for t, f in sampled_frames(reference_path, sample_seconds)]
     if not low_samples or not ref_samples:
-        return {"revision": 1, "mode": "review", "segments": [], "summary": {
-            "proposed_segments": 0, "matched_seconds": 0.0,
+        spans = spans_from_segments([], low_info, reference_info)
+        return {"schema_version": 2, "revision": 1, "mode": "review", "spans": spans, "summary": {
+            **alignment_summary(spans, low_info),
             "warning": "No decodable samples were available. Continue unpaired or replace the inputs.",
         }}
     low_desc = np.stack([_descriptor(f) for _, f in low_samples])
@@ -181,27 +386,27 @@ def analyze_alignment(
             # Only trust audio when it contains repeatable evidence; alternate tracks remain visual-only.
             if float(np.median(audio_similarity.max(axis=1))) >= 0.35:
                 similarities = similarities * 0.8 + audio_similarity * 0.2
-    low_best = similarities.argmax(axis=1)
-    ref_best = similarities.argmax(axis=0)
     candidates: list[Anchor] = []
-    for li, ri_value in enumerate(low_best):
-        ri = int(ri_value)
+    for li, ri in _sequence_pairs(similarities):
         visual = float(similarities[li, ri])
-        # Mutual nearest neighbors suppress repeated titles and recurring shots.
-        if visual < 0.72 or int(ref_best[ri]) != li:
+        if visual < 0.68:
             continue
         geometric = _orb_verify(low_samples[li][1], ref_samples[ri][1])
         if geometric >= 0.45:
             candidates.append(Anchor(low_samples[li][0], ref_samples[ri][0], geometric))
-    anchors = _monotonic(candidates)
+        else:
+            # Ordered, highly similar frames bridge compression-heavy stretches
+            # where ORB has too few stable keypoints. Their lower score keeps the
+            # resulting block visibly less trustworthy during review.
+            candidates.append(Anchor(low_samples[li][0], ref_samples[ri][0], visual * 0.45))
+    anchors = candidates
     segments = _segments_from_anchors(anchors, low_info, reference_info, sample_seconds)
     matched = sum(max(0.0, s.low_end.time_seconds - s.low_start.time_seconds) for s in segments)
     warning = None if segments else "No reliable shared section was proposed. Add one manually or continue unpaired."
+    spans = spans_from_segments(segments, low_info, reference_info)
     return {
-        "revision": 1,
-        "mode": "review",
-        "segments": [s.to_dict() for s in segments],
-        "summary": {"proposed_segments": len(segments), "matched_seconds": matched, "warning": warning},
+        "schema_version": 2, "revision": 1, "mode": "review", "spans": spans,
+        "summary": {**alignment_summary(spans, low_info), "warning": warning},
     }
 
 
@@ -268,7 +473,20 @@ def align_videos(
 ) -> AlignmentReport:
     """Compatibility inspection API: proposals are never silently accepted for training."""
     review = analyze_alignment(low_path, reference_path, low_info, reference_info, sample_seconds)
-    segments = tuple(segment_from_dict({**s, "status": "confirmed"}) for s in review["segments"])
+    if review.get("schema_version") == 2:
+        segments = tuple(
+            MatchSegment(
+                id=span["id"],
+                low_start=frame_ref(span["low_range"]["start_frame"], low_info),
+                low_end=frame_ref(span["low_range"]["end_frame"] - 1, low_info),
+                reference_start=frame_ref(span["reference_range"]["start_frame"], reference_info),
+                reference_end=frame_ref(span["reference_range"]["end_frame"] - 1, reference_info),
+                confidence=float(span.get("confidence", 1.0)), status="confirmed",
+            )
+            for span in review["spans"] if span.get("kind") == "match"
+        )
+    else:
+        segments = tuple(segment_from_dict({**s, "status": "confirmed"}) for s in review["segments"])
     anchors = tuple(
         Anchor(s.low_start.time_seconds, s.reference_start.time_seconds, s.confidence)
         for s in segments

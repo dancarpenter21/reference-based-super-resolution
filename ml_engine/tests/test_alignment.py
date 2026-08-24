@@ -1,7 +1,9 @@
 import cv2
 import numpy as np
 
-from ml_engine.alignment import analyze_alignment, build_pair_manifest, segment_from_dict, align_videos
+from ml_engine.alignment import (
+    align_videos, analyze_alignment, build_dense_pair_manifest, validate_alignment_spans,
+)
 from ml_engine.media import probe
 
 
@@ -47,9 +49,43 @@ def test_different_frame_rates_and_intermittent_gap_form_segments(tmp_path):
 
     review = analyze_alignment(low, ref, low_info, ref_info, sample_seconds=1)
 
-    assert len(review["segments"]) >= 2
-    confirmed = [segment_from_dict({**item, "status": "confirmed"}) for item in review["segments"]]
-    manifest = build_pair_manifest(confirmed, low_info, ref_info)
+    assert review["schema_version"] == 2
+    matches = [span for span in review["spans"] if span["kind"] == "match"]
+    differences = [span for span in review["spans"] if span["kind"] == "difference"]
+    assert len(matches) >= 2
+    assert differences
+    confirmed = [
+        {**span, "status": "confirmed"} if span["kind"] == "match" else span
+        for span in review["spans"]
+    ]
+    confirmed = validate_alignment_spans(confirmed, low_info, ref_info)
+    manifest = build_dense_pair_manifest(confirmed, low_info, ref_info)
     assert manifest
     assert all(0 <= pair["low_frame"] < low_info.frame_count for pair in manifest)
     assert all(0 <= pair["reference_frame"] < ref_info.frame_count for pair in manifest)
+    expected_low_frames = sum(
+        span["low_range"]["end_frame"] - span["low_range"]["start_frame"]
+        for span in confirmed if span["kind"] == "match"
+    )
+    assert len(manifest) == expected_low_frames
+    assert [pair["low_frame"] for pair in manifest] == sorted({pair["low_frame"] for pair in manifest})
+
+
+def test_alignment_partition_exposes_intro_tail_and_divergent_gap(tmp_path):
+    low, ref = tmp_path / "low.mp4", tmp_path / "ref.mp4"
+    write_timeline(low, [0, 1, 2, 3, 12, 13, 6, 7, 8, 14], 10)
+    write_timeline(ref, [20, 21, 0, 1, 2, 3, 9, 10, 11, 15, 6, 7, 8], 8)
+    low_info, ref_info = probe(low), probe(ref)
+
+    review = analyze_alignment(low, ref, low_info, ref_info, sample_seconds=1)
+    spans = validate_alignment_spans(review["spans"], low_info, ref_info)
+
+    assert spans[0]["kind"] == "difference"
+    assert spans[0]["reference_range"] is not None
+    assert any(
+        span["kind"] == "difference" and span["low_range"] and span["reference_range"]
+        for span in spans
+    )
+    assert spans[-1]["kind"] == "difference"
+    assert spans[-1]["low_range"] is not None
+    assert sum(span.get("kind") == "match" for span in spans) >= 2
