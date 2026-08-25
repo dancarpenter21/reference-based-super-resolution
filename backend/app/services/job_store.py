@@ -57,7 +57,8 @@ class JobStore:
               review_data TEXT,
               review_revision INTEGER NOT NULL DEFAULT 0,
               alignment_mode TEXT,
-              matching_mode TEXT NOT NULL DEFAULT 'guided'
+              matching_mode TEXT NOT NULL DEFAULT 'guided',
+              use_audio_matching INTEGER NOT NULL DEFAULT 0
             )
             """
         )
@@ -68,6 +69,7 @@ class JobStore:
             "review_revision": "ALTER TABLE jobs ADD COLUMN review_revision INTEGER NOT NULL DEFAULT 0",
             "alignment_mode": "ALTER TABLE jobs ADD COLUMN alignment_mode TEXT",
             "matching_mode": "ALTER TABLE jobs ADD COLUMN matching_mode TEXT NOT NULL DEFAULT 'guided'",
+            "use_audio_matching": "ALTER TABLE jobs ADD COLUMN use_audio_matching INTEGER NOT NULL DEFAULT 0",
         }
         for name, sql in migrations.items():
             if name not in columns:
@@ -81,7 +83,7 @@ class JobStore:
 
     def create(
         self, low_path: str, reference_path: str, job_dir: str, preset: str,
-        matching_mode: str = "guided",
+        matching_mode: str = "guided", use_audio_matching: bool = False,
     ) -> dict:
         if matching_mode not in {"guided", "reference_only"}:
             raise ValueError(f"Unknown matching mode: {matching_mode}")
@@ -98,12 +100,12 @@ class JobStore:
             """INSERT INTO jobs (
                 id,state,stage,progress,message,preset,low_path,reference_path,job_dir,metrics,
                 warning,error,cancel_requested,created_at,updated_at,phase,review_data,review_revision,
-                alignment_mode,matching_mode
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                alignment_mode,matching_mode,use_audio_matching
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (job_id, "queued", "queued", 0.0, message, preset, low_path,
              reference_path, job_dir, None, None, None, 0, timestamp, timestamp,
              phase, json.dumps(review) if review else None, 0,
-             "unpaired" if reference_only else None, matching_mode),
+             "unpaired" if reference_only else None, matching_mode, int(use_audio_matching)),
         )
         self.connection().commit()
         return self.get(job_id)
@@ -125,6 +127,7 @@ class JobStore:
     def _deserialize(row: sqlite3.Row) -> dict:
         value = dict(row)
         value["cancel_requested"] = bool(value["cancel_requested"])
+        value["use_audio_matching"] = bool(value.get("use_audio_matching", False))
         value["metrics"] = json.loads(value["metrics"]) if value["metrics"] else None
         value["review_data"] = json.loads(value["review_data"]) if value.get("review_data") else None
         return value

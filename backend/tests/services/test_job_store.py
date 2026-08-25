@@ -13,6 +13,17 @@ def test_job_lifecycle(tmp_path):
     assert jobs.cancel(job["id"])["cancel_requested"] is True
 
 
+def test_audio_matching_preference_is_persisted(tmp_path):
+    jobs = JobStore(tmp_path / "jobs.sqlite3")
+    job = jobs.create(
+        "low.mp4", "reference.mp4", str(tmp_path / "audio-job"), "quick",
+        use_audio_matching=True,
+    )
+
+    assert job["use_audio_matching"] is True
+    assert JobStore(jobs.path).get(job["id"])["use_audio_matching"] is True
+
+
 def test_active_job_cannot_be_deleted(tmp_path):
     jobs = JobStore(tmp_path / "jobs.sqlite3")
     job = jobs.create("low.mp4", "reference.mp4", str(tmp_path / "job-2"), "balanced")

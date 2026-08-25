@@ -44,9 +44,18 @@ def test_worker_reports_fatal_loop_error():
 
 def test_worker_pauses_for_review_then_dispatches_approved_processing(tmp_path, monkeypatch):
     jobs = JobStore(tmp_path / "jobs.sqlite3")
-    job = jobs.create("low.mp4", "reference.mp4", str(tmp_path / "job"), "quick")
+    job = jobs.create(
+        "low.mp4", "reference.mp4", str(tmp_path / "job"), "quick",
+        use_audio_matching=True,
+    )
     review = {"revision": 1, "segments": [], "summary": {"proposed_segments": 0}}
-    monkeypatch.setattr(job_worker_module, "analyze_pipeline", lambda *args, **kwargs: review)
+    analysis_calls = []
+
+    def analyze(*args, **kwargs):
+        analysis_calls.append((args, kwargs))
+        return review
+
+    monkeypatch.setattr(job_worker_module, "analyze_pipeline", analyze)
     processed = []
     monkeypatch.setattr(job_worker_module, "process_pipeline", lambda *args, **kwargs: processed.append(args))
     worker = JobWorker(jobs)
@@ -56,6 +65,7 @@ def test_worker_pauses_for_review_then_dispatches_approved_processing(tmp_path, 
 
     assert waiting["state"] == "awaiting_match_review"
     assert waiting["phase"] == "review"
+    assert analysis_calls[0][1]["use_audio_matching"] is True
     approved = jobs.approve_review(job["id"], "unpaired", 1)
     worker._run(approved)
     assert processed

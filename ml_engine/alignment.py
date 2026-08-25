@@ -174,6 +174,31 @@ def _sequence_pairs(similarities: np.ndarray, gap_penalty: float = 0.08) -> list
     return list(reversed(pairs))
 
 
+def _add_audio_evidence(
+    similarities: np.ndarray, low_audio: np.ndarray, ref_audio: np.ndarray,
+) -> np.ndarray:
+    """Blend audio over the samples covered by both audio and video descriptors."""
+    low_count = min(similarities.shape[0], len(low_audio))
+    ref_count = min(similarities.shape[1], len(ref_audio))
+    if low_count == 0 or ref_count == 0:
+        return similarities
+    audio_similarity = low_audio[:low_count] @ ref_audio[:ref_count].T
+    # Repetitive music and ambience can resemble many different moments. Require
+    # both a strong best match and meaningful separation from the runner-up.
+    if ref_count < 2:
+        return similarities
+    ordered = np.partition(audio_similarity, -2, axis=1)
+    best = ordered[:, -1]
+    distinctness = best - ordered[:, -2]
+    if float(np.median(best)) < 0.35 or float(np.median(distinctness)) < 0.02:
+        return similarities
+    combined = similarities.copy()
+    combined[:low_count, :ref_count] = (
+        combined[:low_count, :ref_count] * 0.8 + audio_similarity * 0.2
+    )
+    return combined
+
+
 def _segments_from_anchors(
     anchors: list[Anchor], low_info: MediaInfo, reference_info: MediaInfo, sample_seconds: float
 ) -> list[MatchSegment]:
@@ -365,10 +390,17 @@ def analyze_alignment(
     low_info: MediaInfo,
     reference_info: MediaInfo,
     sample_seconds: float = 1.0,
+    use_audio: bool = False,
 ) -> dict:
     """Build reviewable, chronological segment proposals without trusting them as training truth."""
-    low_samples = list(sampled_frames(low_path, sample_seconds))
-    ref_samples = [(t, normalize_reference_frame(f, reference_info)) for t, f in sampled_frames(reference_path, sample_seconds)]
+    low_samples = [
+        (t, normalize_reference_frame(f, low_info))
+        for t, f in sampled_frames(low_path, sample_seconds)
+    ]
+    ref_samples = [
+        (t, normalize_reference_frame(f, reference_info))
+        for t, f in sampled_frames(reference_path, sample_seconds)
+    ]
     if not low_samples or not ref_samples:
         spans = spans_from_segments([], low_info, reference_info)
         return {"schema_version": 2, "revision": 1, "mode": "review", "spans": spans, "summary": {
@@ -378,14 +410,10 @@ def analyze_alignment(
     low_desc = np.stack([_descriptor(f) for _, f in low_samples])
     ref_desc = np.stack([_descriptor(f) for _, f in ref_samples])
     similarities = low_desc @ ref_desc.T
-    if low_info.has_audio and reference_info.has_audio:
+    if use_audio and low_info.has_audio and reference_info.has_audio:
         low_audio = audio_fingerprints(low_path, sample_seconds)
         ref_audio = audio_fingerprints(reference_path, sample_seconds)
-        if len(low_audio) >= len(low_samples) and len(ref_audio) >= len(ref_samples):
-            audio_similarity = low_audio[:len(low_samples)] @ ref_audio[:len(ref_samples)].T
-            # Only trust audio when it contains repeatable evidence; alternate tracks remain visual-only.
-            if float(np.median(audio_similarity.max(axis=1))) >= 0.35:
-                similarities = similarities * 0.8 + audio_similarity * 0.2
+        similarities = _add_audio_evidence(similarities, low_audio, ref_audio)
     candidates: list[Anchor] = []
     for li, ri in _sequence_pairs(similarities):
         visual = float(similarities[li, ri])

@@ -32,6 +32,11 @@ h1 span { color: #a8a69e; }
 .mode-options span { display: grid; gap: 6px; }
 .mode-options b { color: #f4f1e8; }
 .mode-options small { color: #8e9189; line-height: 1.45; }
+.tooltip-checkbox { position: relative; display: inline-flex; align-items: center; gap: 9px; width: fit-content; margin-top: 14px; color: #c6c8c1; cursor: pointer; }
+.tooltip-checkbox input { accent-color: #ff6b35; }
+.tooltip-checkbox i { display: grid; place-items: center; width: 17px; height: 17px; border: 1px solid #5a5d56; border-radius: 50%; color: #aeb0aa; font: 700 11px ui-monospace, monospace; }
+.tooltip-checkbox:has(input:disabled) { cursor: not-allowed; opacity: .55; }
+.tooltip-checkbox:hover > .button-tooltip, .tooltip-checkbox:focus-within > .button-tooltip { opacity: 1; visibility: visible; transform: translateX(-50%) translateY(0); }
 .controls { display: flex; justify-content: space-between; align-items: end; gap: 18px; margin-top: 24px; }
 .controls label { display: grid; gap: 8px; color: #aaa; font-size: 13px; }
 select, button, .link { border: 1px solid #454842; border-radius: 0; padding: 13px 16px; background: #202220; color: #eee; font: inherit; }

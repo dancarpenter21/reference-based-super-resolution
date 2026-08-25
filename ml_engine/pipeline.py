@@ -24,6 +24,7 @@ def analyze_pipeline(
     job_dir: str | Path,
     update: Callable[[str, float, str, dict | None], None] | None = None,
     cancel: Callable[[], bool] | None = None,
+    use_audio_matching: bool = False,
 ) -> dict:
     job_dir = Path(job_dir)
     job_dir.mkdir(parents=True, exist_ok=True)
@@ -44,7 +45,10 @@ def analyze_pipeline(
     create_navigation_proxy(low_path, job_dir / "low-proxy.mp4")
     create_navigation_proxy(reference_path, job_dir / "reference-proxy.mp4")
     emit(0.05, "Finding shared sections")
-    review = analyze_alignment(low_path, reference_path, low_info, ref_info)
+    review = analyze_alignment(
+        low_path, reference_path, low_info, ref_info, use_audio=use_audio_matching,
+    )
+    review["use_audio_matching"] = use_audio_matching
     review["media"] = media_report
     review["proxy_urls"] = {
         "low": "low-proxy.mp4", "reference": "reference-proxy.mp4",

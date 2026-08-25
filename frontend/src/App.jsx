@@ -70,6 +70,18 @@ function TooltipButton({ tooltip, wrapperClassName = '', children, ...buttonProp
   )
 }
 
+function TooltipCheckbox({ tooltip, children, ...inputProps }) {
+  const tooltipId = useId()
+  return (
+    <label className="tooltip-checkbox">
+      <input {...inputProps} type="checkbox" aria-describedby={tooltipId} />
+      <span>{children}</span>
+      <i aria-hidden="true">?</i>
+      <span className="button-tooltip" id={tooltipId} role="tooltip">{tooltip}</span>
+    </label>
+  )
+}
+
 function CancelJobsDialog({ activeCount, busy, error, onClose, onConfirm }) {
   const titleId = useId()
   const descriptionId = useId()
@@ -944,6 +956,7 @@ function App() {
   const [reference, setReference] = useState(null)
   const [preset, setPreset] = useState('balanced')
   const [matchingMode, setMatchingMode] = useState('guided')
+  const [useAudioMatching, setUseAudioMatching] = useState(false)
   const [jobs, setJobs] = useState([])
   const [jobsLoaded, setJobsLoaded] = useState(false)
   const [selectedId, setSelectedId] = useState(() => window.localStorage.getItem(selectedJobKey))
@@ -1020,6 +1033,7 @@ function App() {
     data.append('reference_video', reference)
     data.append('preset', preset)
     data.append('matching_mode', matchingMode)
+    data.append('use_audio_matching', String(useAudioMatching))
     try {
       const response = await axios.post(`${API}/jobs`, data, {
         onUploadProgress: ({ loaded, total }) => setUploadProgress(total ? Math.round(loaded * 100 / total) : 0),
@@ -1119,6 +1133,14 @@ function App() {
               <span><b>Skip matching · reference only</b><small>Start sooner using synthetic low-quality pairs when the videos do not share trustworthy frames.</small></span>
             </label>
           </fieldset>
+          <TooltipCheckbox
+            checked={useAudioMatching}
+            onChange={(event) => setUseAudioMatching(event.target.checked)}
+            disabled={busy || matchingMode !== 'guided'}
+            tooltip="Repetitive audio, including video-game ambience or music, can cause false-positive or false-negative matches. Leave this off unless both clips share distinctive audio."
+          >
+            Use audio when matching
+          </TooltipCheckbox>
           <div className="controls">
             <label>
               <span>Training preset</span>

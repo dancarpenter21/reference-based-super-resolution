@@ -44,6 +44,7 @@ def public_job(job: dict) -> dict:
     }
     value["alignment_mode"] = job.get("alignment_mode") or (job["metrics"] or {}).get("mode")
     value["matching_mode"] = job.get("matching_mode", "guided")
+    value["use_audio_matching"] = bool(job.get("use_audio_matching", False))
     value["needs_review"] = job["state"] == "awaiting_match_review"
     review = job.get("review_data") or {}
     value["match_summary"] = review.get("summary")
@@ -65,6 +66,7 @@ async def create_job(
     reference_video: Annotated[UploadFile, File()],
     preset: Annotated[str, Form()] = "balanced",
     matching_mode: Annotated[str, Form()] = "guided",
+    use_audio_matching: Annotated[bool, Form()] = False,
 ):
     if preset not in PRESETS:
         raise HTTPException(status_code=400, detail=f"Unknown preset: {preset}")
@@ -80,6 +82,7 @@ async def create_job(
         await save_upload(reference_video, reference_path)
         job = store.create(
             str(low_path), str(reference_path), str(job_dir), preset, matching_mode=matching_mode,
+            use_audio_matching=use_audio_matching,
         )
     except Exception:
         shutil.rmtree(job_dir, ignore_errors=True)

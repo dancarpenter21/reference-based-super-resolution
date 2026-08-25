@@ -106,7 +106,8 @@ class JobWorker:
         try:
             if phase == "analysis":
                 review = analyze_pipeline(
-                    job["low_path"], job["reference_path"], job["job_dir"], update, cancelled
+                    job["low_path"], job["reference_path"], job["job_dir"], update, cancelled,
+                    use_audio_matching=job.get("use_audio_matching", False),
                 )
                 self.jobs.update(
                     job_id, state="awaiting_match_review", stage="awaiting_match_review", progress=0.07,

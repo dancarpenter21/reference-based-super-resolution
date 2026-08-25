@@ -47,6 +47,8 @@ describe('App', () => {
     expect(screen.getByText(/Neither upload has to be complete/)).toBeInTheDocument()
     expect(screen.getByText(/rendered result still follows the supplemental video's timeline/i)).toBeInTheDocument()
     expect(screen.getByRole('radio', { name: /find and match shared frames/i })).toBeChecked()
+    expect(screen.getByRole('checkbox', { name: /use audio when matching/i })).not.toBeChecked()
+    expect(screen.getByRole('tooltip', { name: /video-game ambience or music/i })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /analyze frames/i })).toBeInTheDocument()
     expect(await screen.findByText(/No jobs yet/)).toBeInTheDocument()
   })
@@ -87,7 +89,22 @@ describe('App', () => {
     await waitFor(() => expect(axios.post).toHaveBeenCalled())
     const [, data] = axios.post.mock.calls[0]
     expect(data.get('matching_mode')).toBe('reference_only')
+    expect(data.get('use_audio_matching')).toBe('false')
     expect(data.get('preset')).toBe('balanced')
+  })
+
+  it('submits the opt-in audio matching preference', async () => {
+    axios.post.mockResolvedValue({ data: { ...activeJob, id: 'audio-job', state: 'queued' } })
+    const { container } = render(<App />)
+    const [lowInput, referenceInput] = container.querySelectorAll('input[type="file"]')
+    fireEvent.change(lowInput, { target: { files: [new File(['low'], 'low.mp4', { type: 'video/mp4' })] } })
+    fireEvent.change(referenceInput, { target: { files: [new File(['reference'], 'reference.mp4', { type: 'video/mp4' })] } })
+    fireEvent.click(screen.getByRole('checkbox', { name: /use audio when matching/i }))
+    fireEvent.click(screen.getByRole('button', { name: /analyze frames/i }))
+
+    await waitFor(() => expect(axios.post).toHaveBeenCalled())
+    const [, data] = axios.post.mock.calls[0]
+    expect(data.get('use_audio_matching')).toBe('true')
   })
 
   it('restores the selected historical job from local storage', async () => {

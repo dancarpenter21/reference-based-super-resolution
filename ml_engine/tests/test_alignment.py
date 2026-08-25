@@ -1,10 +1,12 @@
 import cv2
 import numpy as np
+import pytest
 
 from ml_engine.alignment import (
-    align_videos, analyze_alignment, build_dense_pair_manifest, validate_alignment_spans,
+    _add_audio_evidence, align_videos, analyze_alignment, build_dense_pair_manifest,
+    validate_alignment_spans,
 )
-from ml_engine.media import probe
+from ml_engine.media import MediaInfo, probe
 
 
 def write_video(path, seed, frames=90, fps=10):
@@ -25,6 +27,59 @@ def test_unrelated_videos_fall_back(tmp_path):
     report = align_videos(low, ref, probe(low), probe(ref), sample_seconds=1)
     assert report.mode == "unpaired"
     assert report.warning
+
+
+def test_alignment_normalizes_both_streams(monkeypatch):
+    low_info = MediaInfo("low.mp4", 160, 90, 1, 2, 2, "h264", False, "1:1", False)
+    ref_info = MediaInfo("ref.mp4", 320, 180, 1, 2, 2, "h264", False, "1:1", False)
+    frames = [
+        np.random.default_rng(seed).integers(0, 255, (90, 160, 3), dtype=np.uint8)
+        for seed in (1, 2)
+    ]
+    normalized_infos = []
+
+    def samples(path, _sample_seconds):
+        scale = 2 if str(path) == ref_info.path else 1
+        return iter(
+            (float(index), cv2.resize(frame, None, fx=scale, fy=scale))
+            for index, frame in enumerate(frames)
+        )
+
+    def normalize(frame, info):
+        normalized_infos.append(info.path)
+        return cv2.resize(frame, (640, 480))
+
+    monkeypatch.setattr("ml_engine.alignment.sampled_frames", samples)
+    monkeypatch.setattr("ml_engine.alignment.normalize_reference_frame", normalize)
+
+    review = analyze_alignment(low_info.path, ref_info.path, low_info, ref_info)
+
+    assert normalized_infos == [low_info.path, low_info.path, ref_info.path, ref_info.path]
+    assert any(span["kind"] == "match" for span in review["spans"])
+
+
+def test_audio_evidence_uses_available_overlap():
+    visual = np.full((3, 3), 0.5, dtype=np.float32)
+    low_audio = np.eye(2, dtype=np.float32)
+    ref_audio = np.eye(2, dtype=np.float32)
+
+    combined = _add_audio_evidence(visual, low_audio, ref_audio)
+
+    assert combined[:2, :2] == pytest.approx(np.array([[0.6, 0.4], [0.4, 0.6]]))
+    assert combined[2] == pytest.approx(visual[2])
+
+
+def test_audio_evidence_rejects_repetitive_ambiguous_matches():
+    visual = np.full((3, 3), 0.5, dtype=np.float32)
+    repetitive_audio = np.array([
+        [1.0, 0.0],
+        [0.999, 0.045],
+        [0.998, 0.063],
+    ], dtype=np.float32)
+
+    combined = _add_audio_evidence(visual, repetitive_audio, repetitive_audio)
+
+    assert combined == pytest.approx(visual)
 
 
 def write_timeline(path, source_seconds, fps):
