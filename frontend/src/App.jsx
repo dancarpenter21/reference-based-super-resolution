@@ -200,6 +200,21 @@ function matchDraftForSpan(span) {
   return { lowIn: null, lowOut: null, referenceIn: null, referenceOut: null, inTime: null, outTime: null }
 }
 
+function matchPresentation(span) {
+  if (span.kind !== 'match') return { className: 'difference', label: 'Unpaired' }
+  if (span.match_draft) return { className: 'draft', label: 'Saved adjustment' }
+  if (span.origin === 'manual' && span.status === 'confirmed') return { className: 'confirmed adjusted', label: 'Adjusted · confirmed' }
+  if (span.origin === 'manual') return { className: 'adjusted', label: 'Adjusted · review' }
+  if (span.status === 'confirmed') return { className: 'confirmed', label: 'Confirmed' }
+  return { className: 'proposed', label: 'Automatic proposal' }
+}
+
+function adjustmentDelta(value, baseline) {
+  if (value == null || baseline == null || value === baseline) return null
+  const delta = value - baseline
+  return `${delta > 0 ? '+' : '−'}${Math.abs(delta)}`
+}
+
 function UnifiedTracks({ spans, media, total, selectedId, onSelect, onSeek, playhead = null, marks = [] }) {
   const width = Math.max(.001, total)
   return (
@@ -212,16 +227,17 @@ function UnifiedTracks({ spans, media, total, selectedId, onSelect, onSeek, play
             if (!range) return null
             const spanIndex = spans.findIndex((item) => item.id === span.id)
             const sourceWindow = streamWindow(span, spanIndex, stream, media)
-            const className = `${span.kind} ${span.status || ''}${span.id === selectedId ? ' selected' : ''}`
+            const presentation = matchPresentation(span)
+            const className = `${span.kind} ${presentation.className}${span.id === selectedId ? ' selected' : ''}`
             return <button
               type="button"
               key={`${stream}-${span.id}`}
               className={className}
               style={{ left: `${sourceWindow.start / width * 100}%`, width: `${Math.max(.2, (sourceWindow.end - sourceWindow.start) / width * 100)}%` }}
-              aria-label={`${span.kind === 'match' ? span.status : 'unpaired'} ${stream} block, frames ${range.start_frame} through ${range.end_frame - 1}`}
-              title={`${span.kind === 'match' ? `${span.status} match` : 'unpaired footage'} · frames ${range.start_frame}–${range.end_frame - 1}`}
+              aria-label={`${span.kind === 'match' ? presentation.label : 'unpaired'} ${stream} block, frames ${range.start_frame} through ${range.end_frame - 1}`}
+              title={`${span.kind === 'match' ? presentation.label : 'Unpaired footage'} · frames ${range.start_frame}–${range.end_frame - 1}`}
               onClick={() => onSelect(span.id)}
-            />
+            ><span>{presentation.label}</span></button>
           })}
           {marks.map((mark) => <i
             className={`match-mark ${mark.edge}`}
@@ -257,6 +273,7 @@ function UnifiedMatchReview({ job, initialReview, onQueued }) {
   const [playing, setPlaying] = useState(false)
   const [matchDraft, setMatchDraft] = useState(null)
   const [draftDirty, setDraftDirty] = useState(false)
+  const [draftSaveState, setDraftSaveState] = useState(firstMatch?.match_draft ? 'saved' : 'idle')
   const lowVideo = useRef(null)
   const referenceVideo = useRef(null)
   const sequenceTimeRef = useRef(sequenceTime)
@@ -344,6 +361,7 @@ function UnifiedMatchReview({ job, initialReview, onQueued }) {
   useEffect(() => {
     setMatchDraft(matchDraftForSpan(selected))
     setDraftDirty(false)
+    setDraftSaveState(selected.match_draft ? 'saved' : 'idle')
   }, [review.revision, selected.id]) // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
@@ -441,22 +459,38 @@ function UnifiedMatchReview({ job, initialReview, onQueued }) {
 
   function stepPlayhead(stream, amount) { jogPlayhead(stream, playheads[stream] + amount) }
 
-  function markPair(edge) {
+  async function markPair(edge) {
     if (!sourcePosition(sequenceTime, 'low') || !sourcePosition(sequenceTime, 'reference')) {
       setError('Both videos need footage at the shared playhead before you can mark a pair.')
       return
     }
-    setMatchDraft((current) => ({
-      ...current,
-      lowIn: edge === 'in' ? playheads.low : current.lowIn,
-      lowOut: edge === 'out' ? playheads.low : current.lowOut,
-      referenceIn: edge === 'in' ? playheads.reference : current.referenceIn,
-      referenceOut: edge === 'out' ? playheads.reference : current.referenceOut,
-      inTime: edge === 'in' ? sequenceTime : current.inTime,
-      outTime: edge === 'out' ? sequenceTime : current.outTime,
-    }))
+    const nextDraft = {
+      ...matchDraft,
+      lowIn: edge === 'in' ? playheads.low : matchDraft.lowIn,
+      lowOut: edge === 'out' ? playheads.low : matchDraft.lowOut,
+      referenceIn: edge === 'in' ? playheads.reference : matchDraft.referenceIn,
+      referenceOut: edge === 'out' ? playheads.reference : matchDraft.referenceOut,
+      inTime: edge === 'in' ? sequenceTime : matchDraft.inTime,
+      outTime: edge === 'out' ? sequenceTime : matchDraft.outTime,
+    }
+    setMatchDraft(nextDraft)
     setDraftDirty(true)
+    setDraftSaveState('saving')
     setError('')
+    const saved = await edit({
+      operation: 'set_match_draft',
+      draft: {
+        low_in: nextDraft.lowIn, low_out: nextDraft.lowOut,
+        reference_in: nextDraft.referenceIn, reference_out: nextDraft.referenceOut,
+        in_time: nextDraft.inTime, out_time: nextDraft.outTime,
+      },
+    })
+    if (saved) {
+      setDraftDirty(false)
+      setDraftSaveState('saved')
+    } else {
+      setDraftSaveState('failed')
+    }
   }
 
   function goToMark(edge) {
@@ -487,25 +521,23 @@ function UnifiedMatchReview({ job, initialReview, onQueued }) {
   }
 
   async function applyMatchDraft() {
-    if (!draftValidation.valid || saving) return
-    const operation = selected.kind === 'match' ? 'set_match_range' : 'create_match'
-    const saved = await edit({
-      operation,
-      low_start: matchDraft.lowIn, low_end: matchDraft.lowOut + 1,
-      reference_start: matchDraft.referenceIn, reference_end: matchDraft.referenceOut + 1,
-    })
+    if (!draftValidation.valid || draftDirty || !selected.match_draft || saving) return
+    const appliedDraft = { ...matchDraft }
+    const saved = await edit({ operation: 'apply_match_draft' })
     if (!saved) return
     if (selected.kind === 'difference') {
       const created = saved.spans.find((span) => span.kind === 'match'
-        && span.low_range.start_frame === matchDraft.lowIn
-        && span.reference_range.start_frame === matchDraft.referenceIn)
+        && span.low_range.start_frame === appliedDraft.lowIn
+        && span.reference_range.start_frame === appliedDraft.referenceIn)
       if (created) setSelectedId(created.id)
     }
     setDraftDirty(false)
+    setDraftSaveState('idle')
   }
 
-  async function saveMatchDraft() {
+  async function retryMatchDraft() {
     if (!draftDirty || saving) return
+    setDraftSaveState('saving')
     const saved = await edit({
       operation: 'set_match_draft',
       draft: {
@@ -514,7 +546,12 @@ function UnifiedMatchReview({ job, initialReview, onQueued }) {
         in_time: matchDraft.inTime, out_time: matchDraft.outTime,
       },
     })
-    if (saved) setDraftDirty(false)
+    if (saved) {
+      setDraftDirty(false)
+      setDraftSaveState('saved')
+    } else {
+      setDraftSaveState('failed')
+    }
   }
 
   async function discardMatchDraft() {
@@ -526,6 +563,7 @@ function UnifiedMatchReview({ job, initialReview, onQueued }) {
       setMatchDraft(matchDraftForSpan(selected))
     }
     setDraftDirty(false)
+    setDraftSaveState('idle')
   }
 
   useEffect(() => {
@@ -543,6 +581,7 @@ function UnifiedMatchReview({ job, initialReview, onQueued }) {
 
   const proposed = review.summary?.proposed_blocks || 0
   const confirmed = review.summary?.confirmed_blocks || 0
+  const adjusted = review.spans.filter((span) => span.kind === 'match' && span.origin === 'manual').length
   const savedDrafts = review.spans.filter((span) => span.match_draft).length
   const differenceLabel = selected?.kind === 'difference'
     ? selected.low_range && selected.reference_range ? 'Both tracks contain different, unpaired footage here.'
@@ -620,6 +659,7 @@ function UnifiedMatchReview({ job, initialReview, onQueued }) {
     <div className="review-summary">
       <div><b>{confirmed}</b><span>confirmed blocks</span></div>
       <div><b>{proposed}</b><span>needs review</span></div>
+      <div><b>{adjusted}</b><span>user adjusted</span></div>
       <div><b>{formatTime(review.summary?.matched_seconds || 0)}</b><span>approved pairs</span></div>
     </div>
 
@@ -628,7 +668,8 @@ function UnifiedMatchReview({ job, initialReview, onQueued }) {
         <div className="stage-heading"><span>1</span><div><p className="eyebrow">ALIGNMENT MAP</p><h3 id="alignment-map-heading">One sequence, two source tracks</h3></div></div>
         <TooltipButton type="button" className="icon-button" onClick={reanalyze} disabled={saving} aria-label="Rebuild alignment" tooltip="Rebuild the automatic alignment and discard current match decisions."><Icon name="refresh" /></TooltipButton>
       </div>
-      <div className="coverage-key"><span><i className="confirmed" />Confirmed match</span><span><i className="proposed" />Proposed match</span><span><i className="difference" />Unpaired difference</span></div>
+      <p className="stage-help">Jog either source to matching frames, then mark In or Out. Each mark saves automatically; Apply changes the highlighted range, and Confirm approves it for training.</p>
+      <div className="coverage-key"><span><i className="confirmed" />Confirmed</span><span><i className="proposed" />Automatic proposal</span><span><i className="draft" />Saved adjustment</span><span><i className="adjusted" />Adjusted · review</span><span><i className="difference" />Unpaired</span></div>
       {timelineFeed('reference')}
       <UnifiedTracks spans={review.spans} media={review.media} total={total} selectedId={selected?.id} onSelect={selectSpan} onSeek={seekSequence} playhead={sequenceTime} marks={draftMarks} />
       <div className="unified-transport">
@@ -642,8 +683,11 @@ function UnifiedMatchReview({ job, initialReview, onQueued }) {
             const shortTitle = edge === 'in' ? 'In' : 'Out'
             const lowFrame = matchDraft?.[`low${edge === 'in' ? 'In' : 'Out'}`]
             const referenceFrame = matchDraft?.[`reference${edge === 'in' ? 'In' : 'Out'}`]
+            const baselineKey = edge === 'in' ? 'in' : 'out'
+            const lowDelta = adjustmentDelta(lowFrame, selected.adjustment_baseline?.[`low_${baselineKey}`])
+            const referenceDelta = adjustmentDelta(referenceFrame, selected.adjustment_baseline?.[`reference_${baselineKey}`])
             return <div className={`timeline-mark-pair ${edge}`} key={edge}>
-              <span className="timeline-mark-value"><b>{shortTitle}</b>{lowFrame == null ? 'Not set' : `L${lowFrame} ↔ H${referenceFrame}`}</span>
+              <span className="timeline-mark-value"><b>{shortTitle}</b><span>{lowFrame == null ? 'Not set' : `L${lowFrame} ↔ H${referenceFrame}`}</span>{(lowDelta || referenceDelta) && <small>{lowDelta ? `L ${lowDelta}` : 'L —'} · {referenceDelta ? `H ${referenceDelta}` : 'H —'}</small>}</span>
               <div className="match-mark-actions">
                 <TooltipButton type="button" className="icon-button" disabled={lowFrame == null || referenceFrame == null} onClick={() => goToMark(edge)} aria-label={`Go to ${title}`} tooltip={`Move both feeds to the saved ${title} pair.`}><Icon name="locate" /></TooltipButton>
                 <TooltipButton type="button" className="icon-button primary" disabled={saving} aria-label={`Mark ${title} from playheads`} onClick={() => markPair(edge)} tooltip={`Set ${title} from the two current frames.`}><Icon name={edge === 'in' ? 'markIn' : 'markOut'} /></TooltipButton>
@@ -653,18 +697,19 @@ function UnifiedMatchReview({ job, initialReview, onQueued }) {
           <div className="timeline-match-actions">
             {selected.kind === 'match' && <TooltipButton type="button" className="icon-button" disabled={saving} onClick={() => edit({ operation: 'mark_unpaired' })} aria-label="Mark block unpaired" tooltip="Exclude this block from paired training."><Icon name="unpaired" /></TooltipButton>}
             <TooltipButton type="button" className="icon-button" disabled={saving || (!draftDirty && !selected.match_draft)} onClick={discardMatchDraft} aria-label="Discard frame draft" tooltip="Discard saved and unsaved In/Out changes for this block."><Icon name="discard" /></TooltipButton>
-            <TooltipButton type="button" className="icon-button" disabled={saving || !draftDirty} onClick={saveMatchDraft} aria-label="Save frame draft" tooltip="Save this In/Out work now and resume it later."><Icon name="save" /></TooltipButton>
-            <TooltipButton type="button" className="icon-button primary" disabled={saving || !hasDraftChanges || !draftValidation.valid} onClick={applyMatchDraft} aria-label={selected.kind === 'match' ? 'Apply In / Out' : 'Create proposed match'} tooltip={selected.kind === 'match' ? 'Apply the current In and Out pairs to this match.' : 'Create a proposed match from these frame pairs.'}><Icon name="apply" /></TooltipButton>
+            {draftSaveState === 'failed' && <TooltipButton type="button" className="icon-button" disabled={saving} onClick={retryMatchDraft} aria-label="Retry saving frame draft" tooltip="Retry saving these In/Out marks without discarding them."><Icon name="save" /></TooltipButton>}
+            <TooltipButton type="button" className="icon-button primary" disabled={saving || draftDirty || !selected.match_draft || !hasDraftChanges || !draftValidation.valid} onClick={applyMatchDraft} aria-label={selected.kind === 'match' ? 'Apply In / Out' : 'Create proposed match'} tooltip={selected.kind === 'match' ? 'Apply the saved In and Out pairs to this match.' : 'Create a proposed match from the saved frame pairs.'}><Icon name="apply" /></TooltipButton>
             {selected.kind === 'match' && <TooltipButton type="button" className="icon-button primary" disabled={saving || hasDraftChanges || !draftValidation.valid || selected.status === 'confirmed'} onClick={() => edit({ operation: 'set_status', status: 'confirmed' })} aria-label={selected.status === 'confirmed' ? 'Match confirmed' : 'Confirm match'} tooltip={selected.status === 'confirmed' ? 'This match is confirmed for paired training.' : 'Approve this applied match for paired training.'}><Icon name="confirm" /></TooltipButton>}
           </div>
         </div>
         {draftValidation.message && <p className="match-validation" role="status">{draftValidation.message}</p>}
-        {draftDirty && <p className="unsaved-draft">Unsaved In/Out changes</p>}
-        {!draftDirty && selected.match_draft && <p className="saved-draft">Draft saved · safe to leave and resume later</p>}
+        {draftSaveState === 'saving' && <p className="saving-draft" role="status">Saving adjustment…</p>}
+        {draftSaveState === 'failed' && <p className="unsaved-draft" role="alert">Adjustment not saved · retry or discard before leaving</p>}
+        {draftSaveState === 'saved' && selected.match_draft && <p className="saved-draft">Adjustment saved · Apply when ready</p>}
       </div>}
       {timelineFeed('low')}
       {selected && <p className={`selected-span-label ${selected.kind}`}>
-        <b>{selected.kind === 'match' ? `${selected.status} match` : 'unpaired difference'}</b>
+        <b>{selected.kind === 'match' ? matchPresentation(selected).label : 'unpaired difference'}</b>
         <span>{formatTime(selected.sequence_duration_seconds)}</span>
         {selected.confidence != null && <span>{Math.round(selected.confidence * 100)}% confidence</span>}
       </p>}

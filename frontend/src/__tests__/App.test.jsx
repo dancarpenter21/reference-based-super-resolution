@@ -311,8 +311,31 @@ describe('App', () => {
             delete rest.match_draft
             return rest
           }
-          return { ...span, match_draft: payload.draft, status: span.kind === 'match' ? 'proposed' : span.status }
+          const adjustment_baseline = span.kind === 'match' ? span.adjustment_baseline || {
+            low_in: span.low_range.start_frame, low_out: span.low_range.end_frame - 1,
+            reference_in: span.reference_range.start_frame, reference_out: span.reference_range.end_frame - 1,
+          } : undefined
+          return { ...span, match_draft: payload.draft, ...(adjustment_baseline ? { adjustment_baseline } : {}) }
         })
+      } else if (payload.operation === 'apply_match_draft') {
+        const applyingDifference = nextSpans.find((span) => span.id === payload.span_id)?.kind === 'difference'
+        nextSpans = nextSpans.map((span) => {
+          if (span.id !== payload.span_id) return span
+          const draft = span.match_draft
+          const rest = { ...span }
+          delete rest.match_draft
+          if (span.kind === 'difference') return {
+            ...rest, id: 'manual-match', kind: 'match', status: 'proposed', origin: 'manual',
+            low_range: { start_frame: draft.low_in, end_frame: draft.low_out + 1 },
+            reference_range: { start_frame: draft.reference_in, end_frame: draft.reference_out + 1 },
+          }
+          return {
+            ...rest, status: 'proposed', origin: 'manual',
+            low_range: { start_frame: draft.low_in, end_frame: draft.low_out + 1 },
+            reference_range: { start_frame: draft.reference_in, end_frame: draft.reference_out + 1 },
+          }
+        })
+        if (applyingDifference) summary = { ...summary, proposed_blocks: 1 }
       } else if (payload.operation === 'set_status') {
         nextSpans = nextSpans.map((span) => span.id === payload.span_id ? { ...span, status: payload.status } : span)
         summary = { ...summary, proposed_blocks: 0, confirmed_blocks: 1, matched_seconds: 2.1 }
@@ -346,7 +369,7 @@ describe('App', () => {
     expect(matchControls).toContainElement(screen.getByRole('button', { name: /mark match out from playheads/i }))
     expect(matchControls).toContainElement(screen.getByRole('button', { name: /apply in \/ out/i }))
     expect(matchControls).toContainElement(screen.getByRole('button', { name: /confirm match/i }))
-    expect(matchControls).toContainElement(screen.getByRole('button', { name: /save frame draft/i }))
+    expect(screen.queryByRole('button', { name: /save frame draft/i })).not.toBeInTheDocument()
     expect(matchControls).toContainElement(screen.getByRole('button', { name: /discard frame draft/i }))
     expect(timeline).toContainElement(screen.getByRole('slider', { name: /^unified timeline position$/i }))
     expect(screen.queryByText(/^unified timeline position$/i)).not.toBeInTheDocument()
@@ -365,7 +388,6 @@ describe('App', () => {
 
     fireEvent.change(screen.getByRole('slider', { name: /jog reference.*frame/i }), { target: { value: 41 } })
     fireEvent.click(screen.getByRole('button', { name: /mark match out from playheads/i }))
-    fireEvent.click(screen.getByRole('button', { name: /save frame draft/i }))
     await waitFor(() => expect(axios.patch).toHaveBeenCalledWith(
       expect.stringMatching(/match-review$/),
       expect.objectContaining({
@@ -373,26 +395,32 @@ describe('App', () => {
         draft: expect.objectContaining({ low_out: 20, reference_out: 41 }),
       }),
     ))
-    expect(await screen.findByText(/draft saved.*resume later/i)).toBeInTheDocument()
+    expect(await screen.findByText(/adjustment saved.*apply when ready/i)).toBeInTheDocument()
+    expect(screen.getAllByRole('button', { name: /saved adjustment low block/i }).length).toBeGreaterThan(0)
     fireEvent.click(screen.getAllByRole('button', { name: /unpaired reference block, frames 0 through 19/i })[0])
-    fireEvent.click(screen.getByRole('button', { name: /proposed low block, frames 0 through 39/i }))
+    fireEvent.click(screen.getByRole('button', { name: /saved adjustment low block, frames 0 through 39/i }))
     expect(await screen.findByText(/L20.*H41/i)).toBeInTheDocument()
     fireEvent.change(screen.getByRole('slider', { name: /^unified timeline position$/i }), { target: { value: 2 } })
     fireEvent.change(screen.getByRole('slider', { name: /jog reference.*frame/i }), { target: { value: 21 } })
     fireEvent.click(screen.getByRole('button', { name: /mark match in from playheads/i }))
-    expect(screen.getByText(/L0.*H21/i)).toBeInTheDocument()
+    expect(await screen.findByText(/L0.*H21/i)).toBeInTheDocument()
+    await waitFor(() => expect(axios.patch).toHaveBeenCalledWith(
+      expect.stringMatching(/match-review$/),
+      expect.objectContaining({ revision: 2, span_id: 'shared', operation: 'set_match_draft' }),
+    ))
     fireEvent.click(screen.getByRole('button', { name: /apply in \/ out/i }))
     await waitFor(() => expect(axios.patch).toHaveBeenCalledWith(
       expect.stringMatching(/match-review$/),
       expect.objectContaining({
-        revision: 2, span_id: 'shared', operation: 'set_match_range',
-        low_start: 0, low_end: 21, reference_start: 21, reference_end: 42,
+        revision: 3, span_id: 'shared', operation: 'apply_match_draft',
       }),
     ))
+    expect(await screen.findByText(/H \+1/i)).toBeInTheDocument()
+    expect(screen.getAllByRole('button', { name: /adjusted.*review low block/i }).length).toBeGreaterThan(0)
     fireEvent.click(await screen.findByRole('button', { name: /confirm match/i }))
     await waitFor(() => expect(axios.patch).toHaveBeenCalledWith(
       expect.stringMatching(/match-review$/),
-      expect.objectContaining({ revision: 3, span_id: 'shared', operation: 'set_status', status: 'confirmed' }),
+      expect.objectContaining({ revision: 4, span_id: 'shared', operation: 'set_status', status: 'confirmed' }),
     ))
     expect(await screen.findByRole('button', { name: /use dense confirmed pairs/i })).toBeEnabled()
 
@@ -404,16 +432,32 @@ describe('App', () => {
     expect(screen.getByRole('group', { name: /frame match controls/i })).toBeInTheDocument()
     fireEvent.change(screen.getByRole('slider', { name: /jog reference.*frame/i }), { target: { value: 61 } })
     fireEvent.click(screen.getByRole('button', { name: /mark match in from playheads/i }))
+    await waitFor(() => expect(axios.patch).toHaveBeenCalledWith(
+      expect.stringMatching(/match-review$/),
+      expect.objectContaining({ revision: 5, span_id: 'gap', operation: 'set_match_draft' }),
+    ))
+    expect(await screen.findByText(/adjustment saved.*apply when ready/i)).toBeInTheDocument()
     fireEvent.change(screen.getByRole('slider', { name: /^unified timeline position$/i }), { target: { value: 6.5 } })
     fireEvent.click(screen.getByRole('button', { name: /mark match out from playheads/i }))
+    await waitFor(() => expect(axios.patch).toHaveBeenCalledWith(
+      expect.stringMatching(/match-review$/),
+      expect.objectContaining({ revision: 6, span_id: 'gap', operation: 'set_match_draft' }),
+    ))
+    expect(await screen.findByText(/adjustment saved.*apply when ready/i)).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: /create proposed match/i }))
     await waitFor(() => expect(axios.patch).toHaveBeenCalledWith(
       expect.stringMatching(/match-review$/),
       expect.objectContaining({
-        revision: 4, span_id: 'gap', operation: 'create_match',
-        low_start: 40, low_end: 46, reference_start: 61, reference_end: 67,
+        revision: 7, span_id: 'gap', operation: 'apply_match_draft',
       }),
     ))
     expect(await screen.findByRole('button', { name: /use dense confirmed pairs/i })).toBeDisabled()
+
+    axios.patch.mockRejectedValueOnce({ response: { data: { detail: 'Draft storage unavailable' } } })
+    fireEvent.click(screen.getByRole('button', { name: /mark match in from playheads/i }))
+    expect(await screen.findByText(/adjustment not saved.*retry or discard/i)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /apply in \/ out/i })).toBeDisabled()
+    fireEvent.click(screen.getByRole('button', { name: /retry saving frame draft/i }))
+    expect(await screen.findByText(/adjustment saved.*apply when ready/i)).toBeInTheDocument()
   })
 })

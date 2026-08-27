@@ -170,9 +170,9 @@ def test_v2_alignment_edit_validation_and_approval(client, tmp_path, monkeypatch
     review = {
         "schema_version": 2, "revision": 1,
         "spans": [
-            {"id": "before", "kind": "difference", "low_range": {"start_frame": 0, "end_frame": 5}, "reference_range": {"start_frame": 0, "end_frame": 5}, "origin": "automatic", "status": None, "confidence": None},
-            {"id": "shared", "kind": "match", "low_range": {"start_frame": 5, "end_frame": 20}, "reference_range": {"start_frame": 5, "end_frame": 20}, "origin": "automatic", "status": "proposed", "confidence": .95},
-            {"id": "after", "kind": "difference", "low_range": {"start_frame": 20, "end_frame": 30}, "reference_range": {"start_frame": 20, "end_frame": 30}, "origin": "automatic", "status": None, "confidence": None},
+            {"id": "before", "kind": "difference", "low_range": {"start_frame": 0, "end_frame": 5}, "reference_range": {"start_frame": 0, "end_frame": 5}, "origin": "automatic", "status": None, "confidence": None, "sequence_start_seconds": 0, "sequence_duration_seconds": .5},
+            {"id": "shared", "kind": "match", "low_range": {"start_frame": 5, "end_frame": 20}, "reference_range": {"start_frame": 5, "end_frame": 20}, "origin": "automatic", "status": "proposed", "confidence": .95, "sequence_start_seconds": .5, "sequence_duration_seconds": 1.5},
+            {"id": "after", "kind": "difference", "low_range": {"start_frame": 20, "end_frame": 30}, "reference_range": {"start_frame": 20, "end_frame": 30}, "origin": "automatic", "status": None, "confidence": None, "sequence_start_seconds": 2, "sequence_duration_seconds": 1},
         ],
         "media": {"low": probe_dict(low), "reference": probe_dict(reference)},
         "summary": {"proposed_blocks": 1, "confirmed_blocks": 0, "matched_seconds": 0},
@@ -181,14 +181,31 @@ def test_v2_alignment_edit_validation_and_approval(client, tmp_path, monkeypatch
     monkeypatch.setattr(endpoints, "store", jobs)
     monkeypatch.setattr(endpoints.worker, "notify", lambda: None)
 
+    automatic_draft = client.patch(f"/api/v1/jobs/{job['id']}/match-review", json={
+        "revision": 1, "span_id": "shared", "operation": "set_match_draft",
+        "draft": {
+            "low_in": 6, "reference_in": 6, "in_time": .6,
+            "low_out": None, "reference_out": None, "out_time": None,
+        },
+    })
+    automatic_span = next(span for span in automatic_draft.json()["spans"] if span["id"] == "shared")
+    assert automatic_span["origin"] == "automatic" and automatic_span["status"] == "proposed"
+    assert automatic_span["adjustment_baseline"]["low_in"] == 5
+    cleared_automatic = client.patch(f"/api/v1/jobs/{job['id']}/match-review", json={
+        "revision": automatic_draft.json()["revision"], "span_id": "shared",
+        "operation": "set_match_draft", "draft": None,
+    })
+    cleared_automatic_span = next(span for span in cleared_automatic.json()["spans"] if span["id"] == "shared")
+    assert "adjustment_baseline" not in cleared_automatic_span
+
     invalid = client.patch(f"/api/v1/jobs/{job['id']}/match-review", json={
-        "revision": 1, "span_id": "shared", "operation": "move_boundary", "boundary": "start",
+        "revision": cleared_automatic.json()["revision"], "span_id": "shared", "operation": "move_boundary", "boundary": "start",
         "low_frame": 20, "reference_frame": 20,
     })
     assert invalid.status_code == 422
 
     moved = client.patch(f"/api/v1/jobs/{job['id']}/match-review", json={
-        "revision": 1, "span_id": "shared", "operation": "move_boundary", "boundary": "start",
+        "revision": cleared_automatic.json()["revision"], "span_id": "shared", "operation": "move_boundary", "boundary": "start",
         "low_frame": 6, "reference_frame": 6,
     })
     assert moved.status_code == 200
@@ -205,6 +222,10 @@ def test_v2_alignment_edit_validation_and_approval(client, tmp_path, monkeypatch
     assert saved_draft.status_code == 200
     selected_draft = next(span for span in saved_draft.json()["spans"] if span["id"] == "shared")
     assert selected_draft["match_draft"]["low_in"] == 7
+    assert selected_draft["origin"] == "manual" and selected_draft["status"] == "proposed"
+    assert selected_draft["adjustment_baseline"] == {
+        "low_in": 5, "low_out": 19, "reference_in": 5, "reference_out": 19,
+    }
     persisted = client.get(f"/api/v1/jobs/{job['id']}/match-review")
     assert next(span for span in persisted.json()["spans"] if span["id"] == "shared")["match_draft"] == selected_draft["match_draft"]
 
@@ -213,11 +234,18 @@ def test_v2_alignment_edit_validation_and_approval(client, tmp_path, monkeypatch
         "operation": "set_match_draft", "draft": None,
     })
     assert cleared_draft.status_code == 200
-    assert "match_draft" not in next(span for span in cleared_draft.json()["spans"] if span["id"] == "shared")
+    cleared_span = next(span for span in cleared_draft.json()["spans"] if span["id"] == "shared")
+    assert "match_draft" not in cleared_span and cleared_span["adjustment_baseline"]["low_in"] == 5
 
+    complete_draft = client.patch(f"/api/v1/jobs/{job['id']}/match-review", json={
+        "revision": cleared_draft.json()["revision"], "span_id": "shared", "operation": "set_match_draft",
+        "draft": {
+            "low_in": 7, "reference_in": 7, "in_time": .7,
+            "low_out": 18, "reference_out": 18, "out_time": 1.8,
+        },
+    })
     ranged = client.patch(f"/api/v1/jobs/{job['id']}/match-review", json={
-        "revision": cleared_draft.json()["revision"], "span_id": "shared", "operation": "set_match_range",
-        "low_start": 7, "low_end": 19, "reference_start": 7, "reference_end": 19,
+        "revision": complete_draft.json()["revision"], "span_id": "shared", "operation": "apply_match_draft",
     })
     assert ranged.status_code == 200
     ranged_spans = ranged.json()["spans"]
@@ -225,6 +253,8 @@ def test_v2_alignment_edit_validation_and_approval(client, tmp_path, monkeypatch
     assert selected["low_range"] == {"start_frame": 7, "end_frame": 19}
     assert selected["reference_range"] == {"start_frame": 7, "end_frame": 19}
     assert selected["origin"] == "manual" and selected["status"] == "proposed"
+    assert selected["adjustment_baseline"]["low_in"] == 5
+    assert "match_draft" not in selected
     assert ranged_spans[0]["low_range"]["end_frame"] == 7
     assert ranged_spans[-1]["low_range"]["start_frame"] == 19
 
@@ -249,9 +279,25 @@ def test_v2_alignment_edit_validation_and_approval(client, tmp_path, monkeypatch
     })
     assert confirmed.status_code == 200
 
-    difference = next(span for span in confirmed.json()["spans"] if span["kind"] == "difference" and span.get("low_range") and span.get("reference_range"))
+    confirmed_draft = client.patch(f"/api/v1/jobs/{job['id']}/match-review", json={
+        "revision": confirmed.json()["revision"], "span_id": "shared", "operation": "set_match_draft",
+        "draft": {
+            "low_in": 7, "reference_in": 7, "in_time": .7,
+            "low_out": None, "reference_out": None, "out_time": None,
+        },
+    })
+    confirmed_with_draft = next(span for span in confirmed_draft.json()["spans"] if span["id"] == "shared")
+    assert confirmed_with_draft["status"] == "confirmed" and confirmed_with_draft["origin"] == "manual"
+    restored_confirmed = client.patch(f"/api/v1/jobs/{job['id']}/match-review", json={
+        "revision": confirmed_draft.json()["revision"], "span_id": "shared",
+        "operation": "set_match_draft", "draft": None,
+    })
+    restored_span = next(span for span in restored_confirmed.json()["spans"] if span["id"] == "shared")
+    assert restored_span["status"] == "confirmed" and "match_draft" not in restored_span
+
+    difference = next(span for span in restored_confirmed.json()["spans"] if span["kind"] == "difference" and span.get("low_range") and span.get("reference_range"))
     difference_draft = client.patch(f"/api/v1/jobs/{job['id']}/match-review", json={
-        "revision": confirmed.json()["revision"], "span_id": difference["id"], "operation": "set_match_draft",
+        "revision": restored_confirmed.json()["revision"], "span_id": difference["id"], "operation": "set_match_draft",
         "draft": {
             "low_in": difference["low_range"]["start_frame"],
             "reference_in": difference["reference_range"]["start_frame"],

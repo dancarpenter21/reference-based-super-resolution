@@ -216,6 +216,35 @@ def _neighbor_with_range(spans: list[dict], index: int, stream: str, direction: 
     return None
 
 
+def _adjustment_baseline(span: dict) -> dict:
+    return {
+        "low_in": span["low_range"]["start_frame"],
+        "low_out": span["low_range"]["end_frame"] - 1,
+        "reference_in": span["reference_range"]["start_frame"],
+        "reference_out": span["reference_range"]["end_frame"] - 1,
+    }
+
+
+def _editable_envelope(spans: list[dict], index: int, stream: str, frame_count: int) -> tuple[int, int]:
+    selected = spans[index]
+    if selected.get("kind") == "difference":
+        value = selected.get(f"{stream}_range")
+        if not value:
+            raise ValueError(f"The selected block has no {stream} footage")
+        return int(value["start_frame"]), int(value["end_frame"])
+    previous_match = next(
+        (cursor for cursor in range(index - 1, -1, -1) if spans[cursor].get("kind") == "match"),
+        None,
+    )
+    next_match = next(
+        (cursor for cursor in range(index + 1, len(spans)) if spans[cursor].get("kind") == "match"),
+        None,
+    )
+    start = spans[previous_match][f"{stream}_range"]["end_frame"] if previous_match is not None else 0
+    end = spans[next_match][f"{stream}_range"]["start_frame"] if next_match is not None else frame_count
+    return int(start), int(end)
+
+
 def _apply_v2_edit(review: dict, payload: dict, low_info, ref_info) -> dict:
     spans = _plain_spans(review)
     operation = payload.get("operation")
@@ -224,6 +253,28 @@ def _apply_v2_edit(review: dict, payload: dict, low_info, ref_info) -> dict:
     if index < 0:
         raise ValueError("Alignment span was not found")
     selected = spans[index]
+    timeline_spans = review.get("spans", [])
+    if any("sequence_start_seconds" not in span or "sequence_duration_seconds" not in span for span in timeline_spans):
+        timeline_spans = validate_alignment_spans(spans, low_info, ref_info)
+    selected_timeline = next(span for span in timeline_spans if span.get("id") == span_id)
+
+    if operation == "apply_match_draft":
+        draft = selected.get("match_draft")
+        if not draft or any(draft.get(key) is None for key in (
+            "low_in", "low_out", "reference_in", "reference_out", "in_time", "out_time",
+        )):
+            raise ValueError("Set and save both Match In and Match Out before applying this adjustment")
+        low_duration = (int(draft["low_out"]) - int(draft["low_in"]) + 1) / low_info.fps
+        ref_duration = (int(draft["reference_out"]) - int(draft["reference_in"]) + 1) / ref_info.fps
+        tolerance = max(0.5 / low_info.fps, 0.5 / ref_info.fps) + 1e-6
+        if abs(low_duration - ref_duration) > tolerance:
+            raise ValueError("The saved Match In/Out adjustment contains missing or extra frames")
+        payload = {
+            **payload,
+            "low_start": int(draft["low_in"]), "low_end": int(draft["low_out"]) + 1,
+            "reference_start": int(draft["reference_in"]), "reference_end": int(draft["reference_out"]) + 1,
+        }
+        operation = "set_match_range" if selected.get("kind") == "match" else "create_match"
 
     if operation == "set_status":
         if selected.get("kind") != "match" or payload.get("status") not in {"proposed", "confirmed"}:
@@ -239,6 +290,8 @@ def _apply_v2_edit(review: dict, payload: dict, low_info, ref_info) -> dict:
         draft = payload.get("draft")
         if draft is None:
             selected.pop("match_draft", None)
+            if selected.get("origin") == "automatic":
+                selected.pop("adjustment_baseline", None)
         elif not isinstance(draft, dict):
             raise ValueError("draft must be an object or null")
         else:
@@ -254,21 +307,36 @@ def _apply_v2_edit(review: dict, payload: dict, low_info, ref_info) -> dict:
                 if any(value is None for value in values):
                     raise ValueError(f"Saved Match {edge.title()} requires both frames and its timeline position")
                 low_frame, ref_frame = int(low_value), int(ref_value)
-                if not 0 <= low_frame < low_info.frame_count or not 0 <= ref_frame < ref_info.frame_count:
-                    raise ValueError(f"Saved Match {edge.title()} is outside a source video")
+                low_min, low_max = _editable_envelope(spans, index, "low", low_info.frame_count)
+                ref_min, ref_max = _editable_envelope(spans, index, "reference", ref_info.frame_count)
+                if not low_min <= low_frame < low_max or not ref_min <= ref_frame < ref_max:
+                    raise ValueError(f"Saved Match {edge.title()} is outside the editable footage")
+                sequence_start = float(selected_timeline.get("sequence_start_seconds", 0))
+                sequence_end = sequence_start + float(selected_timeline.get("sequence_duration_seconds", 0))
+                if not sequence_start - 1e-6 <= float(time_value) <= sequence_end + 1e-6:
+                    raise ValueError(f"Saved Match {edge.title()} is outside the selected timeline block")
                 saved_draft.update({
                     f"low_{edge}": low_frame, f"reference_{edge}": ref_frame,
                     f"{edge}_time": float(time_value),
                 })
+            if saved_draft.get("low_in") is not None and saved_draft.get("low_out") is not None:
+                if saved_draft["low_in"] > saved_draft["low_out"] or saved_draft["reference_in"] > saved_draft["reference_out"]:
+                    raise ValueError("Match Out cannot be earlier than Match In in either video")
+                if saved_draft["in_time"] > saved_draft["out_time"]:
+                    raise ValueError("Match Out cannot be earlier than Match In on the timeline")
             if not any(saved_draft[key] is not None for key in ("low_in", "low_out")):
                 selected.pop("match_draft", None)
+                if selected.get("origin") == "automatic":
+                    selected.pop("adjustment_baseline", None)
             else:
+                if selected.get("kind") == "match" and not selected.get("adjustment_baseline"):
+                    selected["adjustment_baseline"] = _adjustment_baseline(selected)
                 selected["match_draft"] = saved_draft
-                if selected.get("kind") == "match":
-                    selected.update(status="proposed", origin="manual")
     elif operation == "set_match_range":
         if selected.get("kind") != "match":
             raise ValueError("Only a matched span has editable In and Out marks")
+        if not selected.get("adjustment_baseline"):
+            selected["adjustment_baseline"] = _adjustment_baseline(selected)
         requested = {
             "low_range": {
                 "start_frame": int(payload["low_start"]),
@@ -328,12 +396,15 @@ def _apply_v2_edit(review: dict, payload: dict, low_info, ref_info) -> dict:
         if selected.get("kind") != "match":
             raise ValueError("Only a matched span can be marked unpaired")
         selected.pop("match_draft", None)
+        selected.pop("adjustment_baseline", None)
         selected.update(kind="difference", status=None, confidence=None, origin="manual")
         spans = _coalesce_differences(spans)
     elif operation == "move_boundary":
         if selected.get("kind") != "match" or payload.get("boundary") not in {"start", "end"}:
             raise ValueError("Choose a start or end boundary on a matched span")
         boundary = payload["boundary"]
+        if not selected.get("adjustment_baseline"):
+            selected["adjustment_baseline"] = _adjustment_baseline(selected)
         for stream, info in (("low", low_info), ("reference", ref_info)):
             next_frame = int(payload[f"{stream}_frame"])
             current_range = selected[f"{stream}_range"]
@@ -371,6 +442,7 @@ def _apply_v2_edit(review: dict, payload: dict, low_info, ref_info) -> dict:
         if not (low["start_frame"] < low_frame < low["end_frame"] and reference["start_frame"] < ref_frame < reference["end_frame"]):
             raise ValueError("Split frames must be inside the matched span")
         selected.pop("match_draft", None)
+        selected.pop("adjustment_baseline", None)
         left = {**selected, "id": str(uuid.uuid4()), "status": "proposed", "origin": "manual",
                 "low_range": {"start_frame": low["start_frame"], "end_frame": low_frame},
                 "reference_range": {"start_frame": reference["start_frame"], "end_frame": ref_frame}}
@@ -383,6 +455,7 @@ def _apply_v2_edit(review: dict, payload: dict, low_info, ref_info) -> dict:
             raise ValueError("Only directly adjacent matched spans can be merged")
         following = spans[index + 1]
         selected.pop("match_draft", None)
+        selected.pop("adjustment_baseline", None)
         selected.update(
             id=str(uuid.uuid4()), status="proposed", origin="manual",
             low_range={"start_frame": selected["low_range"]["start_frame"], "end_frame": following["low_range"]["end_frame"]},
