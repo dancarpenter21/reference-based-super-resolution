@@ -7,12 +7,12 @@ The application builds a unified edit-sequence alignment, then pauses for frame-
 ## Current workflow
 
 1. Upload the low-resolution supplement and the high-resolution reference. Neither input is assumed to be complete.
-2. Choose **Find and match shared frames** (recommended) or **Skip matching · reference only**.
-3. Guided jobs probe both streams, create lightweight navigation proxies, and build an ordered map of shared and source-only footage. Reference-only jobs skip this work and go directly to unpaired adaptation.
-4. For guided jobs, use the unified timeline to review automatic match drafts, jog either source independently, set exact Match In/Out frame pairs, and confirm contiguous shared segments.
+2. Choose the reference-native output size or a 480p, 720p, 1080p, or 2160p preset.
+3. The app probes both streams, creates lightweight navigation proxies, and builds an ordered map of shared and source-only footage.
+4. Use the unified timeline to review automatic match drafts, jog either source independently, set exact Match In/Out frame pairs, and confirm contiguous shared segments.
 5. Fine-tune a pretrained RealESRGAN ×2 RRDB model without a GAN discriminator.
-6. Upscale the supplemental stream to 640×480 (4:3), stabilize residual detail across frames, and restore its original audio.
-7. Preview/download the MP4 and its JSON processing report, including the selected matching workflow.
+6. Render one complete timeline: confirmed shared footage comes directly from the high-resolution reference, while supplemental-only footage is upscaled and fitted to the selected canvas.
+7. Preview/download the MP4 and its JSON processing report, including the exact source ranges used in the final edit.
 
 Review jobs survive browser and backend restarts and do not occupy the GPU queue. New reviews show the high-resolution reference above the low-resolution supplement on one edit-sequence axis: vertically aligned solid blocks are proposed or confirmed matches, while hatched difference blocks expose a reference-only intro, a supplemental-only tail, or unrelated footage between the same shared sections. Empty intervals are shown explicitly instead of stretching a shorter source to fill the gap. One shared transport scrubs or plays both navigation videos in sync. When only one source has footage at the playhead, the other preview displays an empty state.
 
@@ -20,9 +20,9 @@ The reference playback feed sits directly above the unified timeline and the sup
 
 Automatic analysis refines coarse samples against nearby full frames, then exposes every result as an editable Match In/Out draft. Position both feeds on the first corresponding images and mark Match In, then repeat for Match Out. Each mark is saved immediately; Apply changes the segment range, and Confirm approves that applied range for training. Taller labeled timeline bands distinguish automatic proposals, saved adjustments, applied user edits, confirmed matches, and unpaired footage. Two-sided difference blocks use the same controls to create new match segments. If either source drops frames or loses footage, applying or confirming rejects the duration mismatch: end the current segment before the discontinuity and create another after it instead of interpolating across the gap. Edits are revision-checked and preserve a complete, non-overlapping partition of both sources. Existing sparse-review jobs remain available in the legacy editor and can be explicitly rebuilt with the unified matcher.
 
-Confirmed blocks produce a dense manifest containing every eligible supplemental frame; difference blocks never produce training pairs. Marking a block unpaired changes only that training relationship and never deletes source footage.
+Confirmed blocks produce a dense manifest containing every eligible supplemental frame; difference blocks never produce training pairs. Marking a block unpaired changes only that training relationship and never deletes source footage. The paired/unpaired approval choice controls training supervision only and does not change output coverage.
 
-The current renderer follows the supplemental video's timeline. The coverage review now exposes high-resolution-only material instead of hiding it behind a “complete source” assumption, but assembling mutually exclusive ranges from both inputs into one ordered output requires an explicit edit/ordering plan and is not yet performed automatically.
+The renderer de-duplicates confirmed overlap by using the original reference range once. Reference-only ranges are copied directly, supplemental-only ranges are upscaled, and a difference block containing unrelated footage from both sources is rendered reference first and supplemental second. Audio follows the selected video source at hard cuts, with silence inserted when that source has no audio. Output uses the reference frame rate and square-pixel display aspect ratio.
 
 The supplied fixtures include 720×480 references and a 480×360, 29.97 fps supplemental source. The matcher treats differing frame rates, intermittent omissions, and non-square reference pixels independently; the user remains the final authority on which proposed segments are safe for paired supervision.
 
@@ -76,7 +76,7 @@ Inspect media and alignment without training:
 .venv/bin/python -m ml_engine.cli inspect test_resources/ss-24-low.mp4 test_resources/ss-24-hi.mp4
 ```
 
-Run an end-to-end job without the web UI:
+Analyze a job from the CLI:
 
 ```bash
 .venv/bin/python -m ml_engine.cli run \
@@ -85,6 +85,8 @@ Run an end-to-end job without the web UI:
 ```
 
 Presets cap fine-tuning at approximately 15 minutes (`quick`), 1 hour (`balanced`), or 4 hours (`quality`). Full-video inference takes additional time.
+
+Combined rendering requires every automatic proposal to be confirmed or marked unpaired. A fresh CLI run therefore writes `match-review.json` and stops before GPU processing when review is still required. The web workflow is the supported path for interactive review and queued processing.
 
 ## Tests
 

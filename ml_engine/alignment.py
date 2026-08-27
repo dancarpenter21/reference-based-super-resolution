@@ -476,6 +476,50 @@ def build_dense_pair_manifest(spans: list[dict], low_info: MediaInfo, reference_
     return pairs
 
 
+def build_edit_manifest(
+    spans: list[dict], low_info: MediaInfo, reference_info: MediaInfo,
+) -> list[dict]:
+    """Build the final, de-duplicated edit from a complete reviewed partition.
+
+    Confirmed shared footage comes from the reference. Difference blocks retain
+    every source-only range; when both sources differ, reference footage is
+    emitted before the supplemental footage.
+    """
+    spans = validate_alignment_spans(spans, low_info, reference_info)
+    if any(span.get("kind") == "match" and span.get("status") != "confirmed" for span in spans):
+        raise ValueError("Resolve every proposed match before rendering the combined timeline")
+
+    clips: list[dict] = []
+    output_cursor = 0
+
+    def append_clip(span: dict, source: str, role: str) -> None:
+        nonlocal output_cursor
+        info = reference_info if source == "reference" else low_info
+        source_range = span[f"{source}_range"]
+        source_count = source_range["end_frame"] - source_range["start_frame"]
+        output_count = max(1, round(source_count / info.fps * reference_info.fps))
+        clips.append({
+            "span_id": span["id"], "source": source, "role": role,
+            "source_range": dict(source_range),
+            "source_duration_seconds": source_count / info.fps,
+            "output_start_frame": output_cursor,
+            "output_end_frame": output_cursor + output_count,
+            "output_duration_seconds": output_count / reference_info.fps,
+            "audio_source": source,
+        })
+        output_cursor += output_count
+
+    for span in spans:
+        if span["kind"] == "match":
+            append_clip(span, "reference", "shared")
+            continue
+        if span.get("reference_range"):
+            append_clip(span, "reference", "reference_only")
+        if span.get("low_range"):
+            append_clip(span, "low", "supplemental_only")
+    return clips
+
+
 def analyze_alignment(
     low_path: str | Path,
     reference_path: str | Path,

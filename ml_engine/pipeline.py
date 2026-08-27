@@ -6,10 +6,11 @@ from pathlib import Path
 
 from .alignment import (
     AlignmentReport, analyze_alignment, build_dense_pair_manifest, build_pair_manifest,
-    segment_from_dict, validate_alignment_spans, validate_segments,
+    spans_from_segments, validate_alignment_spans, validate_segments,
 )
+from .inference.composition import compose_timeline
 from .inference.inference import upscale_video
-from .media import create_navigation_proxy, probe, validate_input, write_json
+from .media import create_navigation_proxy, probe, resolve_output_geometry, validate_input, write_json
 from .training.train import train_model
 from .weights import ensure_pretrained
 
@@ -25,6 +26,7 @@ def analyze_pipeline(
     update: Callable[[str, float, str, dict | None], None] | None = None,
     cancel: Callable[[], bool] | None = None,
     use_audio_matching: bool = False,
+    output_resolution: str = "reference",
 ) -> dict:
     job_dir = Path(job_dir)
     job_dir.mkdir(parents=True, exist_ok=True)
@@ -50,6 +52,11 @@ def analyze_pipeline(
     )
     review["use_audio_matching"] = use_audio_matching
     review["media"] = media_report
+    output_width, output_height = resolve_output_geometry(ref_info, output_resolution)
+    review["output_geometry"] = {
+        "choice": output_resolution, "width": output_width, "height": output_height,
+        "fps": ref_info.fps,
+    }
     review["proxy_urls"] = {
         "low": "low-proxy.mp4", "reference": "reference-proxy.mp4",
     }
@@ -65,6 +72,7 @@ def process_pipeline(
     review: dict,
     update: Callable[[str, float, str, dict | None], None] | None = None,
     cancel: Callable[[], bool] | None = None,
+    output_resolution: str = "reference",
 ) -> dict:
     job_dir = Path(job_dir)
     job_dir.mkdir(parents=True, exist_ok=True)
@@ -82,9 +90,10 @@ def process_pipeline(
     write_json(job_dir / "media.json", media_report)
     mode = review.get("approved_mode", "paired")
     schema_version = int(review.get("schema_version", 1))
-    if mode == "paired" and schema_version == 2:
+    spans: list[dict] = []
+    if schema_version == 2:
         spans = validate_alignment_spans(review.get("spans", []), low_info, ref_info)
-        manifest = build_dense_pair_manifest(spans, low_info, ref_info)
+        manifest = build_dense_pair_manifest(spans, low_info, ref_info) if mode == "paired" else []
         confirmed_spans = [span for span in spans if span.get("kind") == "match" and span.get("status") == "confirmed"]
         confidence = sum(float(span.get("confidence", 1.0)) for span in confirmed_spans) / len(confirmed_spans) if confirmed_spans else 0.0
         verified = sum(
@@ -97,6 +106,15 @@ def process_pipeline(
         manifest = build_pair_manifest(segments, low_info, ref_info)
         confidence = sum(s.confidence for s in segments) / len(segments) if segments else 0.0
         verified = sum(s.low_end.time_seconds - s.low_start.time_seconds for s in segments)
+        if review.get("matching_mode") != "reference_only":
+            rendering_segments = validate_segments(review.get("segments", []), low_info, ref_info)
+            spans = spans_from_segments(rendering_segments, low_info, ref_info)
+    unresolved = (
+        any(span.get("kind") == "match" and span.get("status") != "confirmed" for span in spans)
+        if schema_version == 2 else any(segment.get("status") == "proposed" for segment in review.get("segments", []))
+    )
+    if review.get("matching_mode") != "reference_only" and unresolved:
+        raise ValueError("Resolve every proposed match before processing the combined timeline")
     write_json(job_dir / "pair-manifest.json", {"pairs": manifest})
     alignment = AlignmentReport(
         mode="paired" if manifest else "unpaired", confidence=confidence,
@@ -118,11 +136,24 @@ def process_pipeline(
     )
     write_json(job_dir / "training.json", training)
     output = job_dir / "result.mp4"
-    emit("upscaling", 0.50, "Upscaling low-resolution supplemental video")
-    inference = upscale_video(
-        low_path, checkpoint, output,
-        progress=lambda p, m, metrics: emit("upscaling", 0.50 + p * 0.47, m, metrics), cancel=cancel,
-    )
+    legacy_coverage = review.get("matching_mode") == "reference_only"
+    if legacy_coverage:
+        emit("upscaling", 0.50, "Upscaling legacy supplemental-only video")
+        composition = upscale_video(
+            low_path, checkpoint, output,
+            progress=lambda p, m, metrics: emit("upscaling", 0.50 + p * 0.47, m, metrics), cancel=cancel,
+        )
+        composition.update(coverage_mode="supplemental_only_legacy", clips=[])
+    else:
+        emit("upscaling", 0.50, "Rendering complete combined timeline")
+        composition = compose_timeline(
+            low_path, reference_path, checkpoint, output, spans, output_resolution,
+            progress=lambda p, m, metrics: emit("upscaling", 0.50 + p * 0.47, m, metrics), cancel=cancel,
+        )
+        composition["coverage_mode"] = "combined_timeline"
+    write_json(job_dir / "edit-manifest.json", {
+        "coverage_mode": composition["coverage_mode"], "clips": composition.get("clips", []),
+    })
     report = {
         "media": media_report, "alignment": alignment.to_dict(),
         "matching_mode": review.get("matching_mode", "guided"),
@@ -131,7 +162,8 @@ def process_pipeline(
             "spans": review.get("spans", []) if schema_version == 2 else None,
             "segments": review.get("segments", []) if schema_version == 1 else None,
         },
-        "training": training, "inference": inference, "output": str(output),
+        "training": training, "inference": composition, "composition": composition,
+        "output_resolution": output_resolution, "output": str(output),
     }
     write_json(job_dir / "report.json", report)
     emit("muxing", 0.99, "Finalizing playable MP4")
@@ -145,13 +177,17 @@ def run_pipeline(
     preset: str = "balanced",
     update: Callable[[str, float, str, dict | None], None] | None = None,
     cancel: Callable[[], bool] | None = None,
+    output_resolution: str = "reference",
 ) -> dict:
     """CLI compatibility: analyze, then conservatively run unpaired unless review was approved."""
     job_dir = Path(job_dir)
     review_path = job_dir / "match-review.json"
     review = json.loads(review_path.read_text()) if review_path.exists() else analyze_pipeline(
-        low_path, reference_path, job_dir, update, cancel
+        low_path, reference_path, job_dir, update, cancel, output_resolution=output_resolution
     )
     if "approved_mode" not in review:
         review["approved_mode"] = "unpaired"
-    return process_pipeline(low_path, reference_path, job_dir, preset, review, update, cancel)
+    return process_pipeline(
+        low_path, reference_path, job_dir, preset, review, update, cancel,
+        output_resolution=output_resolution,
+    )

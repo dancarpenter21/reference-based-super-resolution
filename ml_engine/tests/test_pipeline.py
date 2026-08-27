@@ -51,7 +51,10 @@ def test_v2_processing_passes_every_confirmed_low_frame_to_training(tmp_path, mo
         return tmp_path / "checkpoint.pth", {"selected": "fine_tuned"}
 
     monkeypatch.setattr(pipeline, "train_model", train)
-    monkeypatch.setattr(pipeline, "upscale_video", lambda *args, **kwargs: {"frames": 20})
+    monkeypatch.setattr(
+        pipeline, "compose_timeline",
+        lambda *args, **kwargs: {"frames": 25, "clips": [], "width": 80, "height": 60},
+    )
     review = {
         "schema_version": 2, "revision": 3, "approved_mode": "paired", "matching_mode": "guided",
         "spans": [
@@ -68,3 +71,5 @@ def test_v2_processing_passes_every_confirmed_low_frame_to_training(tmp_path, mo
     assert [pair["low_frame"] for pair in captured["pairs"]] == list(range(15))
     assert captured["pairs"][0]["reference_frame"] == 5
     assert captured["pairs"][-1]["reference_frame"] == 19
+    assert report["composition"]["coverage_mode"] == "combined_timeline"
+    assert (tmp_path / "v2-job" / "edit-manifest.json").is_file()

@@ -584,7 +584,7 @@ function UnifiedMatchReview({ job, initialReview, onQueued }) {
   const adjusted = review.spans.filter((span) => span.kind === 'match' && span.origin === 'manual').length
   const savedDrafts = review.spans.filter((span) => span.match_draft).length
   const differenceLabel = selected?.kind === 'difference'
-    ? selected.low_range && selected.reference_range ? 'Both tracks contain different, unpaired footage here.'
+    ? selected.low_range && selected.reference_range ? 'Both tracks contain different footage here. The final output keeps both: reference first, then upscaled supplemental footage.'
       : selected.low_range ? 'Only the supplemental video has footage here.' : 'Only the reference video has footage here.'
     : null
 
@@ -655,6 +655,7 @@ function UnifiedMatchReview({ job, initialReview, onQueued }) {
       <p className="eyebrow">UNIFIED FRAME ALIGNMENT</p>
       <h3>Align the shared edit, then approve training blocks.</h3>
       <p>Both tracks use one sequence axis. Solid blocks correspond frame-by-frame; hatched blocks are visible but excluded from paired training.</p>
+      {review.output_geometry && <p className="mode">Output · <b>{review.output_geometry.width}×{review.output_geometry.height} at {review.output_geometry.fps.toFixed(3)} fps</b></p>}
     </div>
     <div className="review-summary">
       <div><b>{confirmed}</b><span>confirmed blocks</span></div>
@@ -718,7 +719,7 @@ function UnifiedMatchReview({ job, initialReview, onQueued }) {
     </section>
     {error && <p className="alert error" role="alert">{error}</p>}
     <div className="approval-actions">
-      <p>Resolve each proposed match and apply or discard saved drafts. Difference blocks remain visible but never become training pairs.</p>
+      <p>Resolve each proposed match and apply or discard saved drafts. Training mode does not change output coverage: confirmed matches use the reference, and every unpaired range is retained.</p>
       <button type="button" onClick={() => approve('unpaired')} disabled={saving || proposed > 0 || savedDrafts > 0 || draftDirty}>Train without confirmed pairs</button>
       <button type="button" className="primary" onClick={() => approve('paired')} disabled={saving || proposed > 0 || confirmed === 0 || savedDrafts > 0 || draftDirty}>Use dense confirmed pairs and start processing</button>
     </div>
@@ -1249,8 +1250,8 @@ function App() {
   const [low, setLow] = useState(null)
   const [reference, setReference] = useState(null)
   const [preset, setPreset] = useState('balanced')
-  const [matchingMode, setMatchingMode] = useState('guided')
   const [useAudioMatching, setUseAudioMatching] = useState(false)
+  const [outputResolution, setOutputResolution] = useState('reference')
   const [jobs, setJobs] = useState([])
   const [jobsLoaded, setJobsLoaded] = useState(false)
   const [selectedId, setSelectedId] = useState(() => window.localStorage.getItem(selectedJobKey))
@@ -1326,8 +1327,9 @@ function App() {
     data.append('low_video', low)
     data.append('reference_video', reference)
     data.append('preset', preset)
-    data.append('matching_mode', matchingMode)
+    data.append('matching_mode', 'guided')
     data.append('use_audio_matching', String(useAudioMatching))
+    data.append('output_resolution', outputResolution)
     try {
       const response = await axios.post(`${API}/jobs`, data, {
         onUploadProgress: ({ loaded, total }) => setUploadProgress(total ? Math.round(loaded * 100 / total) : 0),
@@ -1408,29 +1410,21 @@ function App() {
           <div className="workflow-explainer" aria-label="How the workflow works">
             <div><b>1 · Find overlap</b><span>Locate sections that appear in both videos, even when their edits or frame rates differ.</span></div>
             <div><b>2 · Learn detail</b><span>Use confirmed high/low frame pairs plus the full high-resolution reference to adapt the upscaler.</span></div>
-            <div><b>3 · Restore footage</b><span>Upscale low-resolution sections using detail learned from the high-resolution version.</span></div>
+            <div><b>3 · Combine the timeline</b><span>Use original reference footage for shared sections and upscale supplemental-only sections into one complete edit.</span></div>
           </div>
           <p className="input-note"><b>Neither upload has to be complete.</b> “Reference” describes the source of visual detail; “supplemental” describes the footage that needs upscaling.</p>
-          <p className="coverage-caveat"><b>Output coverage in this build:</b> the rendered result still follows the supplemental video's timeline. High-resolution-only ranges are exposed during review, but are not automatically inserted into the result because their ordering is ambiguous without an edit plan.</p>
+          <p className="coverage-caveat"><b>Complete output timeline:</b> confirmed shared footage comes from the high-resolution reference. Every unique range is retained; when both videos differ between matches, reference footage is followed by upscaled supplemental footage.</p>
           <div className="files">
             <FileField label="01 · Low-resolution supplement" description="Lower-quality footage that fills gaps or extends the high-resolution version." file={low} onChange={setLow} />
             <FileField label="02 · High-resolution reference" description="Higher-quality footage used as the detail target. It may also contain unique sections." file={reference} onChange={setReference} />
           </div>
-          <fieldset className="mode-options">
-            <legend>How should the reference be used?</legend>
-            <label className={matchingMode === 'guided' ? 'selected' : ''}>
-              <input type="radio" name="matching-mode" value="guided" checked={matchingMode === 'guided'} onChange={(event) => setMatchingMode(event.target.value)} disabled={busy} />
-              <span><b>Find and match shared frames</b><small>Recommended · Review exact matching sections before training for the strongest supervision.</small></span>
-            </label>
-            <label className={matchingMode === 'reference_only' ? 'selected' : ''}>
-              <input type="radio" name="matching-mode" value="reference_only" checked={matchingMode === 'reference_only'} onChange={(event) => setMatchingMode(event.target.value)} disabled={busy} />
-              <span><b>Skip matching · reference only</b><small>Start sooner using synthetic low-quality pairs when the videos do not share trustworthy frames.</small></span>
-            </label>
-          </fieldset>
+          <div className="mode-options required-review">
+            <span><b>Timeline review required</b><small>Match shared frames before processing so the final render can combine both complete sources without duplicating confirmed overlap.</small></span>
+          </div>
           <TooltipCheckbox
             checked={useAudioMatching}
             onChange={(event) => setUseAudioMatching(event.target.checked)}
-            disabled={busy || matchingMode !== 'guided'}
+            disabled={busy}
             tooltip="Repetitive audio, including video-game ambience or music, can cause false-positive or false-negative matches. Leave this off unless both clips share distinctive audio."
           >
             Use audio when matching
@@ -1444,7 +1438,17 @@ function App() {
                 <option value="quality">Quality · up to 4 hours</option>
               </select>
             </label>
-            <button className="primary" disabled={busy} type="submit">{busy ? 'Work already queued or processing' : matchingMode === 'guided' ? 'Analyze frames' : 'Start reference-only processing'}</button>
+            <label>
+              <span>Output size</span>
+              <select aria-label="Output size" value={outputResolution} onChange={(event) => setOutputResolution(event.target.value)} disabled={busy}>
+                <option value="reference">Reference native · recommended</option>
+                <option value="480p">480p</option>
+                <option value="720p">720p</option>
+                <option value="1080p">1080p</option>
+                <option value="2160p">2160p · up to 4K</option>
+              </select>
+            </label>
+            <button className="primary" disabled={busy} type="submit">{busy ? 'Work already queued or processing' : 'Analyze frames'}</button>
           </div>
         </form>
         {uploadProgress > 0 && <p className="upload">Uploading · {uploadProgress}%</p>}
@@ -1470,7 +1474,7 @@ function App() {
             <div className="result">
               <video controls src={`${API.replace('/api/v1', '')}${job.result_url}`} />
               <div className="actions">
-                <a className="primary link" href={`${API.replace('/api/v1', '')}${job.result_url}`} download>Download restored video</a>
+                <a className="primary link" href={`${API.replace('/api/v1', '')}${job.result_url}`} download>Download combined restored video</a>
                 <a href={`${API.replace('/api/v1', '')}${job.report_url}`} download>Download report</a>
               </div>
             </div>

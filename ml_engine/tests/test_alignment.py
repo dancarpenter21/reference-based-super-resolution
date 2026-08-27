@@ -4,6 +4,7 @@ import pytest
 
 from ml_engine.alignment import (
     Anchor, _add_audio_evidence, align_videos, analyze_alignment, build_dense_pair_manifest,
+    build_edit_manifest,
     refine_anchors, validate_alignment_spans,
 )
 from ml_engine.media import MediaInfo, normalize_reference_frame, probe
@@ -186,3 +187,48 @@ def test_alignment_partition_exposes_intro_tail_and_divergent_gap(tmp_path):
     assert spans[-1]["kind"] == "difference"
     assert spans[-1]["low_range"] is not None
     assert sum(span.get("kind") == "match" for span in spans) >= 2
+
+
+def test_edit_manifest_prefers_reference_and_keeps_both_sides_of_differences(tmp_path):
+    low, ref = tmp_path / "edit-low.mp4", tmp_path / "edit-ref.mp4"
+    write_timeline(low, list(range(10)), 10)
+    write_timeline(ref, list(range(12)), 8)
+    low_info, ref_info = probe(low), probe(ref)
+    spans = [
+        {"id": "intro", "kind": "difference", "low_range": None,
+         "reference_range": {"start_frame": 0, "end_frame": 2}, "status": None},
+        {"id": "shared", "kind": "match", "low_range": {"start_frame": 0, "end_frame": 5},
+         "reference_range": {"start_frame": 2, "end_frame": 6}, "status": "confirmed", "confidence": .9},
+        {"id": "different", "kind": "difference", "low_range": {"start_frame": 5, "end_frame": 8},
+         "reference_range": {"start_frame": 6, "end_frame": 9}, "status": None},
+        {"id": "tails", "kind": "difference", "low_range": {"start_frame": 8, "end_frame": low_info.frame_count},
+         "reference_range": {"start_frame": 9, "end_frame": ref_info.frame_count}, "status": None},
+    ]
+
+    clips = build_edit_manifest(spans, low_info, ref_info)
+
+    assert [(clip["source"], clip["role"]) for clip in clips] == [
+        ("reference", "reference_only"), ("reference", "shared"),
+        ("reference", "reference_only"), ("low", "supplemental_only"),
+        ("reference", "reference_only"), ("low", "supplemental_only"),
+    ]
+    assert sum(
+        clip["source_range"]["end_frame"] - clip["source_range"]["start_frame"]
+        for clip in clips if clip["source"] == "reference"
+    ) == ref_info.frame_count
+    assert [clip["output_start_frame"] for clip in clips] == [
+        0, *[clip["output_end_frame"] for clip in clips[:-1]]
+    ]
+
+
+def test_edit_manifest_rejects_unresolved_shared_ranges(tmp_path):
+    low, ref = tmp_path / "draft-low.mp4", tmp_path / "draft-ref.mp4"
+    write_timeline(low, list(range(2)), 10)
+    write_timeline(ref, list(range(2)), 10)
+    low_info, ref_info = probe(low), probe(ref)
+    spans = [{
+        "id": "draft", "kind": "match", "low_range": {"start_frame": 0, "end_frame": 20},
+        "reference_range": {"start_frame": 0, "end_frame": 20}, "status": "proposed",
+    }]
+    with pytest.raises(ValueError, match="Resolve every proposed match"):
+        build_edit_manifest(spans, low_info, ref_info)

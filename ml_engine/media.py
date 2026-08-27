@@ -182,6 +182,66 @@ def normalize_reference_frame(frame: np.ndarray, info: MediaInfo) -> np.ndarray:
     return cv2.resize(frame, (OUTPUT_WIDTH, OUTPUT_HEIGHT), interpolation=cv2.INTER_LANCZOS4)
 
 
+OUTPUT_RESOLUTIONS = {"reference", "480p", "720p", "1080p", "2160p"}
+
+
+def active_display_geometry(info: MediaInfo) -> tuple[int, int]:
+    """Return the border-free, square-pixel display geometry for a video."""
+    left, top, right, bottom = detect_content_bounds(info)
+    width = max(2, round((right - left) * sar_value(info.sample_aspect_ratio)))
+    height = max(2, bottom - top)
+    return width, height
+
+
+def resolve_output_geometry(reference_info: MediaInfo, choice: str) -> tuple[int, int]:
+    if choice == "legacy_640x480":
+        return OUTPUT_WIDTH, OUTPUT_HEIGHT
+    if choice not in OUTPUT_RESOLUTIONS:
+        raise MediaError(f"Unknown output resolution: {choice}")
+    native_width, native_height = active_display_geometry(reference_info)
+    ratio = native_width / native_height
+    if choice == "reference":
+        width, height = native_width, native_height
+    else:
+        height = int(choice.removesuffix("p"))
+        width = round(height * ratio)
+    # H.264/yuv420p needs even dimensions. Keep every selectable canvas within 4K.
+    scale = min(1.0, 3840 / width, 2160 / height)
+    width = max(2, int(width * scale) // 2 * 2)
+    height = max(2, int(height * scale) // 2 * 2)
+    return width, height
+
+
+def prepare_output_frame(
+    frame: np.ndarray, info: MediaInfo, size: tuple[int, int],
+) -> np.ndarray:
+    """Correct source geometry and crop-to-fill a final square-pixel canvas."""
+    left, top, right, bottom = detect_content_bounds(info)
+    frame = frame[top:bottom, left:right]
+    display_width = max(1, round(frame.shape[1] * sar_value(info.sample_aspect_ratio)))
+    if display_width != frame.shape[1]:
+        interpolation = cv2.INTER_AREA if display_width < frame.shape[1] else cv2.INTER_CUBIC
+        frame = cv2.resize(frame, (display_width, frame.shape[0]), interpolation=interpolation)
+    return crop_to_fill(frame, size)
+
+
+def crop_to_fill(frame: np.ndarray, size: tuple[int, int]) -> np.ndarray:
+    """Center-crop without distortion, then resize to an exact canvas."""
+    target_width, target_height = size
+    h, w = frame.shape[:2]
+    target_ratio = target_width / target_height
+    if w / h > target_ratio:
+        cropped_width = max(1, round(h * target_ratio))
+        offset = (w - cropped_width) // 2
+        frame = frame[:, offset:offset + cropped_width]
+    elif w / h < target_ratio:
+        cropped_height = max(1, round(w / target_ratio))
+        offset = (h - cropped_height) // 2
+        frame = frame[offset:offset + cropped_height]
+    interpolation = cv2.INTER_AREA if frame.shape[1] > target_width else cv2.INTER_LANCZOS4
+    return cv2.resize(frame, size, interpolation=interpolation)
+
+
 def sampled_frames(path: str | Path, every_seconds: float = 1.0) -> Iterator[tuple[float, np.ndarray]]:
     cap = cv2.VideoCapture(str(path))
     fps = cap.get(cv2.CAP_PROP_FPS)

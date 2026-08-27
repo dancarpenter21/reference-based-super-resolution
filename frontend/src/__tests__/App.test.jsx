@@ -14,7 +14,7 @@ const activeJob = {
 
 const completedJob = {
   id: 'done-job-5678', state: 'completed', stage: 'completed', progress: 1,
-  message: 'Upscaled video is ready', preset: 'quick', metrics: null, warning: null, error: null,
+  message: 'Combined restored video is ready', preset: 'quick', metrics: null, warning: null, error: null,
   created_at: '2026-08-12T12:00:00+00:00', updated_at: '2026-08-12T13:00:00+00:00',
   result_url: '/api/v1/jobs/done-job-5678/result', report_url: '/api/v1/jobs/done-job-5678/report',
 }
@@ -45,9 +45,10 @@ describe('App', () => {
     expect(screen.getByText('01 · Low-resolution supplement')).toBeInTheDocument()
     expect(screen.getByText('02 · High-resolution reference')).toBeInTheDocument()
     expect(screen.getByText(/Neither upload has to be complete/)).toBeInTheDocument()
-    expect(screen.getByText(/rendered result still follows the supplemental video's timeline/i)).toBeInTheDocument()
-    expect(screen.getByRole('radio', { name: /find and match shared frames/i })).toBeChecked()
+    expect(screen.getByText(/confirmed shared footage comes from the high-resolution reference/i)).toBeInTheDocument()
+    expect(screen.getByText(/timeline review required/i)).toBeInTheDocument()
     expect(screen.getByRole('checkbox', { name: /use audio when matching/i })).not.toBeChecked()
+    expect(screen.getByRole('combobox', { name: /output size/i })).toHaveValue('reference')
     expect(screen.getByRole('tooltip', { name: /video-game ambience or music/i })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /analyze frames/i })).toBeInTheDocument()
     expect(await screen.findByText(/No jobs yet/)).toBeInTheDocument()
@@ -73,26 +74,25 @@ describe('App', () => {
     expect(window.localStorage.getItem('refsr-selected-job')).toBe(activeJob.id)
   })
 
-  it('submits reference-only mode without frame analysis', async () => {
+  it('submits mandatory matching and the selected output size', async () => {
     const queued = {
-      ...activeJob, id: 'reference-only', state: 'queued', stage: 'queued', progress: 0,
-      message: 'Queued for reference-only processing', matching_mode: 'reference_only',
+      ...activeJob, id: 'combined', state: 'queued', stage: 'queued', progress: 0,
+      message: 'Queued for frame analysis', matching_mode: 'guided', output_resolution: '1080p',
     }
     axios.post.mockResolvedValue({ data: queued })
     const { container } = render(<App />)
     const [lowInput, referenceInput] = container.querySelectorAll('input[type="file"]')
     fireEvent.change(lowInput, { target: { files: [new File(['low'], 'low.mp4', { type: 'video/mp4' })] } })
     fireEvent.change(referenceInput, { target: { files: [new File(['reference'], 'reference.mp4', { type: 'video/mp4' })] } })
-    fireEvent.click(screen.getByRole('radio', { name: /skip matching/i }))
-
-    expect(screen.getByRole('button', { name: /start reference-only processing/i })).toBeInTheDocument()
-    fireEvent.click(screen.getByRole('button', { name: /start reference-only processing/i }))
+    fireEvent.change(screen.getByRole('combobox', { name: /output size/i }), { target: { value: '1080p' } })
+    fireEvent.click(screen.getByRole('button', { name: /analyze frames/i }))
 
     await waitFor(() => expect(axios.post).toHaveBeenCalled())
     const [, data] = axios.post.mock.calls[0]
-    expect(data.get('matching_mode')).toBe('reference_only')
+    expect(data.get('matching_mode')).toBe('guided')
     expect(data.get('use_audio_matching')).toBe('false')
     expect(data.get('preset')).toBe('balanced')
+    expect(data.get('output_resolution')).toBe('1080p')
   })
 
   it('submits the opt-in audio matching preference', async () => {
@@ -115,7 +115,7 @@ describe('App', () => {
 
     render(<App />)
 
-    expect(await screen.findByText('Upscaled video is ready')).toBeInTheDocument()
+    expect(await screen.findByText('Combined restored video is ready')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /delete job and files/i })).toBeInTheDocument()
   })
 

@@ -10,7 +10,9 @@ from ml_engine.media import (
     MediaError,
     MediaInfo,
     normalize_reference_frame,
+    prepare_output_frame,
     probe,
+    resolve_output_geometry,
     validate_input,
 )
 
@@ -37,6 +39,24 @@ def test_reference_normalization_corrects_geometry():
     info = MediaInfo("x", 720, 480, 24, 1, 1 / 24, "h264", False, "10:11", False)
     result = normalize_reference_frame(np.zeros((480, 720, 3), np.uint8), info)
     assert result.shape == (480, 640, 3)
+
+
+def test_output_geometry_follows_reference_sar_and_presets():
+    info = MediaInfo("x", 720, 480, 24, 1, 1 / 24, "h264", False, "10:11", False)
+    assert resolve_output_geometry(info, "reference") == (654, 480)
+    assert resolve_output_geometry(info, "1080p") == (1474, 1080)
+    assert resolve_output_geometry(info, "legacy_640x480") == (640, 480)
+    with pytest.raises(MediaError, match="Unknown output resolution"):
+        resolve_output_geometry(info, "cinema")
+
+
+def test_prepare_output_frame_crops_to_fill_without_stretching():
+    info = MediaInfo("x", 100, 100, 24, 1, 1 / 24, "h264", False, "1:1", False)
+    frame = np.zeros((100, 100, 3), np.uint8)
+    frame[:20] = 255
+    result = prepare_output_frame(frame, info, (160, 90))
+    assert result.shape == (90, 160, 3)
+    assert result[0].mean() == 0  # The bright outer edge was cropped, not stretched.
 
 
 def test_reference_normalization_removes_persistent_black_border(tmp_path):

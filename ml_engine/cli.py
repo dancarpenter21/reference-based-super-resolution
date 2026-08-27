@@ -20,6 +20,10 @@ def main() -> None:
     run.add_argument("reference")
     run.add_argument("--output-dir", default="data/cli-job")
     run.add_argument("--preset", choices=("quick", "balanced", "quality"), default="balanced")
+    run.add_argument(
+        "--output-resolution", choices=("reference", "480p", "720p", "1080p", "2160p"),
+        default="reference",
+    )
     commands.add_parser("gpu-check")
     args = parser.parse_args()
     if args.command == "gpu-check":
@@ -33,6 +37,7 @@ def main() -> None:
         report = run_pipeline(
             args.low, args.reference, args.output_dir, args.preset,
             update=lambda stage, p, message, metrics: print(f"[{stage}] {p:.1%} {message}"),
+            output_resolution=args.output_resolution,
         )
         print(json.dumps(report, indent=2))
 

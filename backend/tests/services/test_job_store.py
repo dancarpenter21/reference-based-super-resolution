@@ -24,6 +24,18 @@ def test_audio_matching_preference_is_persisted(tmp_path):
     assert JobStore(jobs.path).get(job["id"])["use_audio_matching"] is True
 
 
+def test_output_resolution_is_persisted(tmp_path):
+    jobs = JobStore(tmp_path / "jobs.sqlite3")
+    job = jobs.create(
+        "low.mp4", "reference.mp4", str(tmp_path / "resolution-job"), "quick",
+        output_resolution="1080p",
+    )
+    assert job["output_resolution"] == "1080p"
+    assert JobStore(jobs.path).get(job["id"])["output_resolution"] == "1080p"
+    with pytest.raises(ValueError, match="Unknown output resolution"):
+        jobs.create("low.mp4", "reference.mp4", str(tmp_path / "bad-size"), "quick", output_resolution="8k")
+
+
 def test_active_job_cannot_be_deleted(tmp_path):
     jobs = JobStore(tmp_path / "jobs.sqlite3")
     job = jobs.create("low.mp4", "reference.mp4", str(tmp_path / "job-2"), "balanced")

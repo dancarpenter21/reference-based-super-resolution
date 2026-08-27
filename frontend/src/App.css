@@ -32,6 +32,7 @@ h1 span { color: #a8a69e; }
 .mode-options span { display: grid; gap: 6px; }
 .mode-options b { color: #f4f1e8; }
 .mode-options small { color: #8e9189; line-height: 1.45; }
+.mode-options.required-review { grid-template-columns: 1fr; border: 1px solid #454842; padding: 16px; }
 .tooltip-checkbox { position: relative; display: inline-flex; align-items: center; gap: 9px; width: fit-content; margin-top: 14px; color: #c6c8c1; cursor: pointer; }
 .tooltip-checkbox input { accent-color: #ff6b35; }
 .tooltip-checkbox i { display: grid; place-items: center; width: 17px; height: 17px; border: 1px solid #5a5d56; border-radius: 50%; color: #aeb0aa; font: 700 11px ui-monospace, monospace; }

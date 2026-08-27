@@ -46,7 +46,7 @@ def test_worker_pauses_for_review_then_dispatches_approved_processing(tmp_path, 
     jobs = JobStore(tmp_path / "jobs.sqlite3")
     job = jobs.create(
         "low.mp4", "reference.mp4", str(tmp_path / "job"), "quick",
-        use_audio_matching=True,
+        use_audio_matching=True, output_resolution="1080p",
     )
     review = {"revision": 1, "segments": [], "summary": {"proposed_segments": 0}}
     analysis_calls = []
@@ -57,7 +57,7 @@ def test_worker_pauses_for_review_then_dispatches_approved_processing(tmp_path, 
 
     monkeypatch.setattr(job_worker_module, "analyze_pipeline", analyze)
     processed = []
-    monkeypatch.setattr(job_worker_module, "process_pipeline", lambda *args, **kwargs: processed.append(args))
+    monkeypatch.setattr(job_worker_module, "process_pipeline", lambda *args, **kwargs: processed.append((args, kwargs)))
     worker = JobWorker(jobs)
 
     worker._run(job)
@@ -66,9 +66,11 @@ def test_worker_pauses_for_review_then_dispatches_approved_processing(tmp_path, 
     assert waiting["state"] == "awaiting_match_review"
     assert waiting["phase"] == "review"
     assert analysis_calls[0][1]["use_audio_matching"] is True
+    assert analysis_calls[0][1]["output_resolution"] == "1080p"
     approved = jobs.approve_review(job["id"], "unpaired", 1)
     worker._run(approved)
     assert processed
+    assert processed[0][1]["output_resolution"] == "1080p"
     assert jobs.get(job["id"])["state"] == "completed"
 
 

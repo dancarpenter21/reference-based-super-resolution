@@ -108,6 +108,7 @@ class JobWorker:
                 review = analyze_pipeline(
                     job["low_path"], job["reference_path"], job["job_dir"], update, cancelled,
                     use_audio_matching=job.get("use_audio_matching", False),
+                    output_resolution=job.get("output_resolution", "legacy_640x480"),
                 )
                 self.jobs.update(
                     job_id, state="awaiting_match_review", stage="awaiting_match_review", progress=0.07,
@@ -119,11 +120,13 @@ class JobWorker:
             current = self.jobs.get(job_id)
             process_pipeline(
                 job["low_path"], job["reference_path"], job["job_dir"], job["preset"],
-                current["review_data"] or {}, update, cancelled,
+                current["review_data"] or {},
+                output_resolution=job.get("output_resolution", "legacy_640x480"),
+                update=update, cancel=cancelled,
             )
             self.jobs.update(
                 job_id, state="completed", stage="completed", progress=1.0,
-                message="Upscaled video is ready",
+                message="Combined restored video is ready",
             )
         except (Cancelled, InterruptedError):
             if self.stop_event.is_set() and not self.jobs.get(job_id)["cancel_requested"]:

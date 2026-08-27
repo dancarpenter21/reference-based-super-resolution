@@ -37,6 +37,26 @@ def test_create_rejects_unknown_matching_mode(client):
     assert "matching mode" in response.json()["detail"]
 
 
+def test_create_requires_review_and_valid_output_resolution(client):
+    files = {
+        "low_video": ("low.mp4", BytesIO(b"placeholder"), "video/mp4"),
+        "reference_video": ("reference.mp4", BytesIO(b"placeholder"), "video/mp4"),
+    }
+    skipped = client.post("/api/v1/jobs", data={"matching_mode": "reference_only"}, files=files)
+    assert skipped.status_code == 400
+    assert "timeline review is required" in skipped.json()["detail"]
+
+    invalid_size = client.post(
+        "/api/v1/jobs", data={"output_resolution": "8k"},
+        files={
+            "low_video": ("low.mp4", BytesIO(b"placeholder"), "video/mp4"),
+            "reference_video": ("reference.mp4", BytesIO(b"placeholder"), "video/mp4"),
+        },
+    )
+    assert invalid_size.status_code == 400
+    assert "output resolution" in invalid_size.json()["detail"]
+
+
 def test_unknown_job_is_404(client):
     assert client.get("/api/v1/jobs/not-real").status_code == 404
 

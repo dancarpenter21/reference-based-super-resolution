@@ -18,7 +18,7 @@ from ml_engine.config import PRESETS
 from ml_engine.alignment import (
     alignment_summary, frame_ref, validate_alignment_spans, validate_segments,
 )
-from ml_engine.media import normalize_reference_frame, probe, read_frame
+from ml_engine.media import OUTPUT_RESOLUTIONS, normalize_reference_frame, probe, read_frame
 
 router = APIRouter()
 ALLOWED_SUFFIXES = {".mp4", ".mov", ".m4v"}
@@ -45,9 +45,11 @@ def public_job(job: dict) -> dict:
     value["alignment_mode"] = job.get("alignment_mode") or (job["metrics"] or {}).get("mode")
     value["matching_mode"] = job.get("matching_mode", "guided")
     value["use_audio_matching"] = bool(job.get("use_audio_matching", False))
+    value["output_resolution"] = job.get("output_resolution", "legacy_640x480")
     value["needs_review"] = job["state"] == "awaiting_match_review"
     review = job.get("review_data") or {}
     value["match_summary"] = review.get("summary")
+    value["output_geometry"] = review.get("output_geometry")
     value["eta_seconds"] = None
     if 0 < job["progress"] < 1 and job["state"] not in {"failed", "cancelled", "awaiting_match_review"}:
         elapsed = (datetime.now(UTC) - datetime.fromisoformat(job["created_at"])).total_seconds()
@@ -67,11 +69,17 @@ async def create_job(
     preset: Annotated[str, Form()] = "balanced",
     matching_mode: Annotated[str, Form()] = "guided",
     use_audio_matching: Annotated[bool, Form()] = False,
+    output_resolution: Annotated[str, Form()] = "reference",
 ):
     if preset not in PRESETS:
         raise HTTPException(status_code=400, detail=f"Unknown preset: {preset}")
-    if matching_mode not in {"guided", "reference_only"}:
-        raise HTTPException(status_code=400, detail=f"Unknown matching mode: {matching_mode}")
+    if matching_mode != "guided":
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported matching mode; timeline review is required for combined output",
+        )
+    if output_resolution not in OUTPUT_RESOLUTIONS:
+        raise HTTPException(status_code=400, detail=f"Unknown output resolution: {output_resolution}")
     low_suffix = Path(low_video.filename or "").suffix.lower()
     ref_suffix = Path(reference_video.filename or "").suffix.lower()
     if low_suffix not in ALLOWED_SUFFIXES or ref_suffix not in ALLOWED_SUFFIXES:
@@ -82,7 +90,7 @@ async def create_job(
         await save_upload(reference_video, reference_path)
         job = store.create(
             str(low_path), str(reference_path), str(job_dir), preset, matching_mode=matching_mode,
-            use_audio_matching=use_audio_matching,
+            use_audio_matching=use_audio_matching, output_resolution=output_resolution,
         )
     except Exception:
         shutil.rmtree(job_dir, ignore_errors=True)

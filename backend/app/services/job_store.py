@@ -58,7 +58,8 @@ class JobStore:
               review_revision INTEGER NOT NULL DEFAULT 0,
               alignment_mode TEXT,
               matching_mode TEXT NOT NULL DEFAULT 'guided',
-              use_audio_matching INTEGER NOT NULL DEFAULT 0
+              use_audio_matching INTEGER NOT NULL DEFAULT 0,
+              output_resolution TEXT NOT NULL DEFAULT 'legacy_640x480'
             )
             """
         )
@@ -70,6 +71,7 @@ class JobStore:
             "alignment_mode": "ALTER TABLE jobs ADD COLUMN alignment_mode TEXT",
             "matching_mode": "ALTER TABLE jobs ADD COLUMN matching_mode TEXT NOT NULL DEFAULT 'guided'",
             "use_audio_matching": "ALTER TABLE jobs ADD COLUMN use_audio_matching INTEGER NOT NULL DEFAULT 0",
+            "output_resolution": "ALTER TABLE jobs ADD COLUMN output_resolution TEXT NOT NULL DEFAULT 'legacy_640x480'",
         }
         for name, sql in migrations.items():
             if name not in columns:
@@ -84,12 +86,19 @@ class JobStore:
     def create(
         self, low_path: str, reference_path: str, job_dir: str, preset: str,
         matching_mode: str = "guided", use_audio_matching: bool = False,
+        output_resolution: str = "reference",
     ) -> dict:
         if matching_mode not in {"guided", "reference_only"}:
             raise ValueError(f"Unknown matching mode: {matching_mode}")
+        if output_resolution not in {
+            "reference", "480p", "720p", "1080p", "2160p", "legacy_640x480",
+        }:
+            raise ValueError(f"Unknown output resolution: {output_resolution}")
         job_id = Path(job_dir).name
         timestamp = now()
         reference_only = matching_mode == "reference_only"
+        if reference_only:
+            output_resolution = "legacy_640x480"
         phase = "processing" if reference_only else "analysis"
         review = {
             "revision": 0, "approved_mode": "unpaired", "matching_mode": "reference_only",
@@ -100,12 +109,13 @@ class JobStore:
             """INSERT INTO jobs (
                 id,state,stage,progress,message,preset,low_path,reference_path,job_dir,metrics,
                 warning,error,cancel_requested,created_at,updated_at,phase,review_data,review_revision,
-                alignment_mode,matching_mode,use_audio_matching
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                alignment_mode,matching_mode,use_audio_matching,output_resolution
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (job_id, "queued", "queued", 0.0, message, preset, low_path,
              reference_path, job_dir, None, None, None, 0, timestamp, timestamp,
              phase, json.dumps(review) if review else None, 0,
-             "unpaired" if reference_only else None, matching_mode, int(use_audio_matching)),
+             "unpaired" if reference_only else None, matching_mode, int(use_audio_matching),
+             output_resolution),
         )
         self.connection().commit()
         return self.get(job_id)
