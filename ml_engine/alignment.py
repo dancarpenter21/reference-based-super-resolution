@@ -204,6 +204,7 @@ def _segments_from_anchors(
 ) -> list[MatchSegment]:
     groups: list[list[Anchor]] = []
     current: list[Anchor] = []
+    frame_tolerance = max(2 / low_info.fps, 2 / reference_info.fps)
     for anchor in anchors:
         if current:
             prior = current[-1]
@@ -215,8 +216,8 @@ def _segments_from_anchors(
             # Missing confidence samples do not imply an edit. Split only when the
             # two source clocks actually diverge or their persistent offset changes.
             if (
-                abs(low_delta - ref_delta) > sample_seconds * 1.5
-                or abs(current_offset - expected_offset) > sample_seconds * 1.5
+                abs(low_delta - ref_delta) > frame_tolerance
+                or abs(current_offset - expected_offset) > frame_tolerance
             ):
                 if len(current) >= 2:
                     groups.append(current)
@@ -242,6 +243,91 @@ def _segments_from_anchors(
             confidence=float(np.mean([a.score for a in group])),
         ))
     return segments
+
+
+def _read_selected_descriptors(
+    path: str | Path, info: MediaInfo, indices: set[int],
+) -> dict[int, np.ndarray]:
+    """Decode selected CFR frames in batches without retaining full-size images."""
+    wanted = sorted(index for index in indices if 0 <= index < info.frame_count)
+    if not wanted:
+        return {}
+    groups: list[tuple[int, int]] = []
+    start = end = wanted[0]
+    for index in wanted[1:]:
+        if index == end + 1:
+            end = index
+        else:
+            groups.append((start, end))
+            start = end = index
+    groups.append((start, end))
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        return {}
+    result: dict[int, np.ndarray] = {}
+    wanted_set = set(wanted)
+    try:
+        for start, end in groups:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start)
+            for index in range(start, end + 1):
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                if index in wanted_set:
+                    result[index] = _descriptor(normalize_reference_frame(frame, info))
+    finally:
+        cap.release()
+    return result
+
+
+def refine_anchors(
+    reference_path: str | Path,
+    anchors: list[Anchor],
+    low_samples: list[tuple[float, np.ndarray]],
+    low_info: MediaInfo,
+    reference_info: MediaInfo,
+    search_seconds: float = 1.0,
+) -> list[Anchor]:
+    """Refine coarse reference times to exact frames near each sampled pair."""
+    if not anchors or not Path(reference_path).is_file():
+        return anchors
+    samples_by_frame = {
+        round(time * low_info.fps): frame for time, frame in low_samples
+    }
+    radius = max(2, round(reference_info.fps * search_seconds))
+    candidates_by_anchor: list[tuple[Anchor, int, range]] = []
+    candidate_indices: set[int] = set()
+    for anchor in anchors:
+        low_index = round(anchor.low_time * low_info.fps)
+        center = round(anchor.reference_time * reference_info.fps)
+        candidates = range(
+            max(0, center - radius),
+            min(reference_info.frame_count, center + radius + 1),
+        )
+        candidates_by_anchor.append((anchor, low_index, candidates))
+        candidate_indices.update(candidates)
+    reference_descriptors = _read_selected_descriptors(reference_path, reference_info, candidate_indices)
+    refined: list[Anchor] = []
+    for anchor, low_index, candidates in candidates_by_anchor:
+        low_frame = samples_by_frame.get(low_index)
+        if low_frame is None:
+            refined.append(anchor)
+            continue
+        low_descriptor = _descriptor(low_frame)
+        scores = [
+            (float(low_descriptor @ reference_descriptors[index]), index)
+            for index in candidates if index in reference_descriptors
+        ]
+        if not scores:
+            refined.append(anchor)
+            continue
+        score, reference_index = max(scores)
+        refined.append(Anchor(
+            low_index / low_info.fps,
+            reference_index / reference_info.fps,
+            max(0.0, min(1.0, score)),
+        ))
+    return refined
 
 
 def _frame_range(start: int, end: int) -> FrameRange | None:
@@ -354,8 +440,14 @@ def validate_alignment_spans(
                 low_range, ref_range = span["low_range"], span["reference_range"]
                 low_duration = (low_range["end_frame"] - low_range["start_frame"]) / low_info.fps
                 ref_duration = (ref_range["end_frame"] - ref_range["start_frame"]) / reference_info.fps
-                if abs(low_duration - ref_duration) > max(0.25, min(low_duration, ref_duration) * 0.03):
-                    raise ValueError(f"Matched span {span_id} durations disagree; split or adjust its cuts")
+                # Half a frame accounts for unavoidable rounding when the source
+                # rates differ, while still rejecting a full missing frame.
+                tolerance = max(0.5 / low_info.fps, 0.5 / reference_info.fps) + 1e-6
+                if abs(low_duration - ref_duration) > tolerance:
+                    raise ValueError(
+                        f"Matched span {span_id} contains missing or extra frames; "
+                        "mark out before the discontinuity and create a new segment after it"
+                    )
         elif not present:
             raise ValueError(f"Difference span {span_id} does not contain footage")
     for stream in ("low", "reference"):
@@ -427,7 +519,7 @@ def analyze_alignment(
             # where ORB has too few stable keypoints. Their lower score keeps the
             # resulting block visibly less trustworthy during review.
             candidates.append(Anchor(low_samples[li][0], ref_samples[ri][0], visual * 0.45))
-    anchors = candidates
+    anchors = refine_anchors(reference_path, candidates, low_samples, low_info, reference_info)
     segments = _segments_from_anchors(anchors, low_info, reference_info, sample_seconds)
     matched = sum(max(0.0, s.low_end.time_seconds - s.low_start.time_seconds) for s in segments)
     warning = None if segments else "No reliable shared section was proposed. Add one manually or continue unpaired."

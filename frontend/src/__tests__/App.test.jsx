@@ -64,7 +64,9 @@ describe('App', () => {
 
     expect((await screen.findAllByText('JOB active-j')).length).toBeGreaterThan(0)
     expect(screen.getByText('JOB done-job')).toBeInTheDocument()
-    expect(screen.getByText('step 40 · 2 min remaining')).toBeInTheDocument()
+    const currentPanel = screen.getByText('step 40 · 2 min remaining').closest('section')
+    const jobsPanel = screen.getByRole('region', { name: 'Jobs' })
+    expect(currentPanel.compareDocumentPosition(jobsPanel) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
     expect(screen.getByRole('button', { name: /work already queued or processing/i })).toBeDisabled()
     expect(screen.getByText('Processing job active-j')).toBeInTheDocument()
     expect(screen.getByText('AMD Radeon RX 9070 XT')).toBeInTheDocument()
@@ -264,7 +266,7 @@ describe('App', () => {
     expect(await screen.findByRole('button', { name: /use confirmed pairs/i })).toBeEnabled()
   })
 
-  it('shows a unified sequence with explicit one-sided footage and dense frame navigation', async () => {
+  it('stacks synchronized feeds around one timeline and edits exact Match In and Out pairs', async () => {
     const reviewJob = {
       ...activeJob, id: 'unified-job', state: 'awaiting_match_review', stage: 'awaiting_match_review', progress: .07,
       message: 'Review proposed frame matches', needs_review: true, matching_mode: 'guided',
@@ -272,12 +274,13 @@ describe('App', () => {
     const spans = [
       { id: 'intro', kind: 'difference', low_range: null, reference_range: { start_frame: 0, end_frame: 20 }, status: null, confidence: null, origin: 'automatic', sequence_start_seconds: 0, sequence_duration_seconds: 2 },
       { id: 'shared', kind: 'match', low_range: { start_frame: 0, end_frame: 40 }, reference_range: { start_frame: 20, end_frame: 60 }, status: 'proposed', confidence: .96, origin: 'automatic', sequence_start_seconds: 2, sequence_duration_seconds: 4 },
-      { id: 'tail', kind: 'difference', low_range: { start_frame: 40, end_frame: 60 }, reference_range: null, status: null, confidence: null, origin: 'automatic', sequence_start_seconds: 6, sequence_duration_seconds: 2 },
+      { id: 'gap', kind: 'difference', low_range: { start_frame: 40, end_frame: 50 }, reference_range: { start_frame: 60, end_frame: 70 }, status: null, confidence: null, origin: 'automatic', sequence_start_seconds: 6, sequence_duration_seconds: 1 },
+      { id: 'tail', kind: 'difference', low_range: { start_frame: 50, end_frame: 70 }, reference_range: null, status: null, confidence: null, origin: 'automatic', sequence_start_seconds: 7, sequence_duration_seconds: 2 },
     ]
     const review = {
       schema_version: 2, revision: 1, spans,
-      summary: { proposed_blocks: 1, confirmed_blocks: 0, difference_blocks: 2, matched_seconds: 0 },
-      media: { low: { fps: 10, frame_count: 60, duration: 6 }, reference: { fps: 10, frame_count: 60, duration: 6 } },
+      summary: { proposed_blocks: 1, confirmed_blocks: 0, difference_blocks: 3, matched_seconds: 0 },
+      media: { low: { fps: 10, frame_count: 70, duration: 7 }, reference: { fps: 10, frame_count: 70, duration: 7 } },
       proxy_urls: { low: '/low.mp4', reference: '/reference.mp4' },
     }
     axios.get.mockImplementation((url) => {
@@ -285,30 +288,132 @@ describe('App', () => {
       if (url.endsWith('/match-review')) return Promise.resolve({ data: review })
       return Promise.resolve({ data: { jobs: [reviewJob] } })
     })
-    axios.patch.mockImplementation((_, payload) => Promise.resolve({ data: {
-      ...review, revision: 2,
-      spans: spans.map((span) => span.id === payload.span_id ? { ...span, status: 'confirmed' } : span),
-      summary: { ...review.summary, proposed_blocks: 0, confirmed_blocks: 1, matched_seconds: 4 },
-    } }))
+    let currentReview = review
+    axios.patch.mockImplementation((_, payload) => {
+      let nextSpans = currentReview.spans
+      let summary = currentReview.summary
+      if (payload.operation === 'set_match_range') {
+        nextSpans = nextSpans.map((span) => {
+          if (span.id !== payload.span_id) return span
+          const rest = { ...span }
+          delete rest.match_draft
+          return {
+            ...rest, status: 'proposed', origin: 'manual',
+            low_range: { start_frame: payload.low_start, end_frame: payload.low_end },
+            reference_range: { start_frame: payload.reference_start, end_frame: payload.reference_end },
+          }
+        })
+      } else if (payload.operation === 'set_match_draft') {
+        nextSpans = nextSpans.map((span) => {
+          if (span.id !== payload.span_id) return span
+          if (!payload.draft) {
+            const rest = { ...span }
+            delete rest.match_draft
+            return rest
+          }
+          return { ...span, match_draft: payload.draft, status: span.kind === 'match' ? 'proposed' : span.status }
+        })
+      } else if (payload.operation === 'set_status') {
+        nextSpans = nextSpans.map((span) => span.id === payload.span_id ? { ...span, status: payload.status } : span)
+        summary = { ...summary, proposed_blocks: 0, confirmed_blocks: 1, matched_seconds: 2.1 }
+      } else if (payload.operation === 'create_match') {
+        nextSpans = nextSpans.map((span) => span.id === payload.span_id ? {
+          ...span, id: 'manual-match', kind: 'match', status: 'proposed', origin: 'manual',
+          low_range: { start_frame: payload.low_start, end_frame: payload.low_end },
+          reference_range: { start_frame: payload.reference_start, end_frame: payload.reference_end },
+        } : span)
+        summary = { ...summary, proposed_blocks: 1, confirmed_blocks: 1 }
+      }
+      currentReview = { ...currentReview, revision: currentReview.revision + 1, spans: nextSpans, summary }
+      return Promise.resolve({ data: currentReview })
+    })
+    const playSpy = vi.spyOn(window.HTMLMediaElement.prototype, 'play').mockResolvedValue()
 
     render(<App />)
 
     expect(await screen.findByText(/one sequence, two source tracks/i)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /zoom in/i })).not.toBeInTheDocument()
+    expect(screen.queryByRole('slider', { name: /timeline viewport position/i })).not.toBeInTheDocument()
     expect(screen.getAllByRole('button', { name: /unpaired reference block, frames 0 through 19/i }).length).toBeGreaterThan(0)
-    expect(screen.getAllByRole('button', { name: /unpaired low block, frames 40 through 59/i }).length).toBeGreaterThan(0)
+    expect(screen.getAllByRole('button', { name: /unpaired low block, frames 50 through 69/i }).length).toBeGreaterThan(0)
     expect(screen.getByAltText(/supplemental.*frame 0/i)).toBeInTheDocument()
     expect(screen.getByAltText(/reference.*frame 20/i)).toBeInTheDocument()
+    const highFeed = screen.getByLabelText(/reference.*playback feed/i)
+    const timeline = screen.getByLabelText(/unified video timeline/i)
+    const matchControls = screen.getByRole('group', { name: /frame match controls/i })
+    const lowFeed = screen.getByLabelText(/supplemental.*playback feed/i)
+    expect(matchControls).toContainElement(screen.getByRole('button', { name: /mark match in from playheads/i }))
+    expect(matchControls).toContainElement(screen.getByRole('button', { name: /mark match out from playheads/i }))
+    expect(matchControls).toContainElement(screen.getByRole('button', { name: /apply in \/ out/i }))
+    expect(matchControls).toContainElement(screen.getByRole('button', { name: /confirm match/i }))
+    expect(matchControls).toContainElement(screen.getByRole('button', { name: /save frame draft/i }))
+    expect(matchControls).toContainElement(screen.getByRole('button', { name: /discard frame draft/i }))
+    expect(timeline).toContainElement(screen.getByRole('slider', { name: /^unified timeline position$/i }))
+    expect(screen.queryByText(/^unified timeline position$/i)).not.toBeInTheDocument()
+    expect(highFeed.compareDocumentPosition(timeline) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(timeline.compareDocumentPosition(matchControls) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(matchControls.compareDocumentPosition(lowFeed) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(timeline.compareDocumentPosition(lowFeed) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: /play both timeline videos/i }))
+    await waitFor(() => expect(playSpy).toHaveBeenCalledTimes(2))
+    fireEvent.click(screen.getByRole('button', { name: /pause both timeline videos/i }))
 
-    fireEvent.change(screen.getByRole('slider', { name: /matched frame position/i }), { target: { value: 500 } })
+    fireEvent.change(screen.getByRole('slider', { name: /^unified timeline position$/i }), { target: { value: 4 } })
     expect(screen.getByAltText(/supplemental.*frame 20/i)).toBeInTheDocument()
     expect(screen.getByAltText(/reference.*frame 40/i)).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /use dense confirmed pairs/i })).toBeDisabled()
 
-    fireEvent.click(screen.getByRole('button', { name: /confirm matched block/i }))
+    fireEvent.change(screen.getByRole('slider', { name: /jog reference.*frame/i }), { target: { value: 41 } })
+    fireEvent.click(screen.getByRole('button', { name: /mark match out from playheads/i }))
+    fireEvent.click(screen.getByRole('button', { name: /save frame draft/i }))
     await waitFor(() => expect(axios.patch).toHaveBeenCalledWith(
       expect.stringMatching(/match-review$/),
-      expect.objectContaining({ revision: 1, span_id: 'shared', operation: 'set_status', status: 'confirmed' }),
+      expect.objectContaining({
+        revision: 1, span_id: 'shared', operation: 'set_match_draft',
+        draft: expect.objectContaining({ low_out: 20, reference_out: 41 }),
+      }),
+    ))
+    expect(await screen.findByText(/draft saved.*resume later/i)).toBeInTheDocument()
+    fireEvent.click(screen.getAllByRole('button', { name: /unpaired reference block, frames 0 through 19/i })[0])
+    fireEvent.click(screen.getByRole('button', { name: /proposed low block, frames 0 through 39/i }))
+    expect(await screen.findByText(/L20.*H41/i)).toBeInTheDocument()
+    fireEvent.change(screen.getByRole('slider', { name: /^unified timeline position$/i }), { target: { value: 2 } })
+    fireEvent.change(screen.getByRole('slider', { name: /jog reference.*frame/i }), { target: { value: 21 } })
+    fireEvent.click(screen.getByRole('button', { name: /mark match in from playheads/i }))
+    expect(screen.getByText(/L0.*H21/i)).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /apply in \/ out/i }))
+    await waitFor(() => expect(axios.patch).toHaveBeenCalledWith(
+      expect.stringMatching(/match-review$/),
+      expect.objectContaining({
+        revision: 2, span_id: 'shared', operation: 'set_match_range',
+        low_start: 0, low_end: 21, reference_start: 21, reference_end: 42,
+      }),
+    ))
+    fireEvent.click(await screen.findByRole('button', { name: /confirm match/i }))
+    await waitFor(() => expect(axios.patch).toHaveBeenCalledWith(
+      expect.stringMatching(/match-review$/),
+      expect.objectContaining({ revision: 3, span_id: 'shared', operation: 'set_status', status: 'confirmed' }),
     ))
     expect(await screen.findByRole('button', { name: /use dense confirmed pairs/i })).toBeEnabled()
+
+    fireEvent.change(screen.getByRole('slider', { name: /^unified timeline position$/i }), { target: { value: 1 } })
+    expect(screen.getByText(/supplemental.*has no source video at/i)).toBeInTheDocument()
+    expect(screen.getByAltText(/reference.*frame 10/i)).toBeInTheDocument()
+
+    fireEvent.click(screen.getAllByRole('button', { name: /unpaired low block, frames 40 through 49/i })[0])
+    expect(screen.getByRole('group', { name: /frame match controls/i })).toBeInTheDocument()
+    fireEvent.change(screen.getByRole('slider', { name: /jog reference.*frame/i }), { target: { value: 61 } })
+    fireEvent.click(screen.getByRole('button', { name: /mark match in from playheads/i }))
+    fireEvent.change(screen.getByRole('slider', { name: /^unified timeline position$/i }), { target: { value: 6.5 } })
+    fireEvent.click(screen.getByRole('button', { name: /mark match out from playheads/i }))
+    fireEvent.click(screen.getByRole('button', { name: /create proposed match/i }))
+    await waitFor(() => expect(axios.patch).toHaveBeenCalledWith(
+      expect.stringMatching(/match-review$/),
+      expect.objectContaining({
+        revision: 4, span_id: 'gap', operation: 'create_match',
+        low_start: 40, low_end: 46, reference_start: 61, reference_end: 67,
+      }),
+    ))
+    expect(await screen.findByRole('button', { name: /use dense confirmed pairs/i })).toBeDisabled()
   })
 })

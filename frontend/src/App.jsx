@@ -10,6 +10,29 @@ const streamLabel = {
   low: 'Supplemental · low resolution',
   reference: 'Reference · high resolution',
 }
+const trackLabel = { low: 'Low res', reference: 'High res' }
+
+function Icon({ name }) {
+  const paths = {
+    play: <path d="m8 5 11 7-11 7Z" />,
+    pause: <><path d="M8 5v14" /><path d="M16 5v14" /></>,
+    earlier10: <><path d="M6 5v14" /><path d="m17 7-7 5 7 5" /></>,
+    earlier: <path d="m15 6-6 6 6 6" />,
+    later: <path d="m9 6 6 6-6 6" />,
+    later10: <><path d="M18 5v14" /><path d="m7 7 7 5-7 5" /></>,
+    closest: <><circle cx="10" cy="10" r="5" /><path d="m14 14 5 5M18 4v4M16 6h4" /></>,
+    markIn: <><path d="M5 4v16" /><path d="m18 7-7 5 7 5" /></>,
+    markOut: <><path d="M19 4v16" /><path d="m6 7 7 5-7 5" /></>,
+    locate: <><circle cx="12" cy="12" r="5" /><path d="M12 2v3M12 19v3M2 12h3M19 12h3" /></>,
+    save: <><path d="M5 4h11l3 3v13H5Z" /><path d="M8 4v6h8V5M8 20v-6h8v6" /></>,
+    apply: <><path d="M5 5h14v14H5Z" /><path d="m8 12 3 3 5-6" /></>,
+    confirm: <path d="m5 12 4 4L19 6" />,
+    discard: <><path d="M9 7H5v-4" /><path d="M5 7a8 8 0 1 1-1 8" /></>,
+    unpaired: <><path d="m8 8-2-2a3 3 0 0 0-4 4l3 3a3 3 0 0 0 4 0l1-1" /><path d="m16 16 2 2a3 3 0 0 0 4-4l-3-3a3 3 0 0 0-4 0l-1 1M4 20 20 4" /></>,
+    refresh: <><path d="M20 7v5h-5" /><path d="M4 17v-5h5M18.5 9A7 7 0 0 0 6 6.5L4 9M5.5 15A7 7 0 0 0 18 17.5l2-2.5" /></>,
+  }
+  return <svg className="button-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{paths[name]}</svg>
+}
 
 function matchingLabel(mode) {
   return mode === 'reference_only' ? 'reference only' : 'guided matching'
@@ -135,35 +158,87 @@ function CancelJobsDialog({ activeCount, busy, error, onClose, onConfirm }) {
   )
 }
 
-function UnifiedTracks({ spans, total, windowStart = 0, windowEnd = total, selectedId, onSelect, detail = false }) {
-  const width = Math.max(.001, windowEnd - windowStart)
-  const visible = spans.filter((span) => {
-    const start = span.sequence_start_seconds
-    return start + span.sequence_duration_seconds > windowStart && start < windowEnd
-  })
+function streamWindow(span, spanIndex, stream, media) {
+  const range = span?.[`${stream}_range`]
+  if (!range) return null
+  const sourceDuration = (range.end_frame - range.start_frame) / media[stream].fps
+  if (span.kind === 'match') {
+    return { start: span.sequence_start_seconds, end: span.sequence_start_seconds + span.sequence_duration_seconds }
+  }
+  // A leading source-only section is right-aligned against the first shared
+  // frame. Later differences start at the preceding shared cut.
+  const start = spanIndex === 0
+    ? span.sequence_start_seconds + span.sequence_duration_seconds - sourceDuration
+    : span.sequence_start_seconds
+  return { start, end: start + sourceDuration }
+}
+
+function locationAt(spans, time, total) {
+  if (!spans.length) return null
+  const clamped = Math.max(0, Math.min(total, Number(time)))
+  return spans.find((span) => clamped >= span.sequence_start_seconds
+    && clamped < span.sequence_start_seconds + span.sequence_duration_seconds)
+    || spans[spans.length - 1]
+}
+
+function matchDraftForSpan(span) {
+  if (span?.match_draft) {
+    return {
+      lowIn: span.match_draft.low_in, lowOut: span.match_draft.low_out,
+      referenceIn: span.match_draft.reference_in, referenceOut: span.match_draft.reference_out,
+      inTime: span.match_draft.in_time, outTime: span.match_draft.out_time,
+    }
+  }
+  if (span?.kind === 'match') {
+    return {
+      lowIn: span.low_range.start_frame, lowOut: span.low_range.end_frame - 1,
+      referenceIn: span.reference_range.start_frame, referenceOut: span.reference_range.end_frame - 1,
+      inTime: span.sequence_start_seconds,
+      outTime: span.sequence_start_seconds + span.sequence_duration_seconds,
+    }
+  }
+  return { lowIn: null, lowOut: null, referenceIn: null, referenceOut: null, inTime: null, outTime: null }
+}
+
+function UnifiedTracks({ spans, media, total, selectedId, onSelect, onSeek, playhead = null, marks = [] }) {
+  const width = Math.max(.001, total)
   return (
-    <div className={`unified-tracks ${detail ? 'detail' : 'overview'}`}>
+    <div className="unified-tracks" aria-label="Unified video timeline">
       {['reference', 'low'].map((stream) => <div className="unified-track-row" key={stream}>
-        <span>{streamLabel[stream]}</span>
+        <span>{trackLabel[stream]}</span>
         <div className="unified-track">
-          {visible.map((span) => {
+          {spans.map((span) => {
             const range = span[`${stream}_range`]
             if (!range) return null
-            const start = Math.max(windowStart, span.sequence_start_seconds)
-            const end = Math.min(windowEnd, span.sequence_start_seconds + span.sequence_duration_seconds)
+            const spanIndex = spans.findIndex((item) => item.id === span.id)
+            const sourceWindow = streamWindow(span, spanIndex, stream, media)
             const className = `${span.kind} ${span.status || ''}${span.id === selectedId ? ' selected' : ''}`
             return <button
               type="button"
               key={`${stream}-${span.id}`}
               className={className}
-              style={{ left: `${(start - windowStart) / width * 100}%`, width: `${Math.max(.2, (end - start) / width * 100)}%` }}
+              style={{ left: `${sourceWindow.start / width * 100}%`, width: `${Math.max(.2, (sourceWindow.end - sourceWindow.start) / width * 100)}%` }}
               aria-label={`${span.kind === 'match' ? span.status : 'unpaired'} ${stream} block, frames ${range.start_frame} through ${range.end_frame - 1}`}
               title={`${span.kind === 'match' ? `${span.status} match` : 'unpaired footage'} · frames ${range.start_frame}–${range.end_frame - 1}`}
               onClick={() => onSelect(span.id)}
             />
           })}
+          {marks.map((mark) => <i
+            className={`match-mark ${mark.edge}`}
+            key={`${stream}-${mark.edge}`}
+            style={{ left: `${mark.time / width * 100}%` }}
+          ><span>{mark.edge}</span></i>)}
+          {playhead != null && <i className="timeline-playhead" style={{ left: `${playhead / width * 100}%` }} />}
         </div>
       </div>)}
+      {onSeek && <input
+        className="timeline-direct-scrubber"
+        aria-label="Unified timeline position"
+        aria-valuetext={`${formatTime(playhead)} of ${formatTime(total)}`}
+        title="Click or drag across the tracks to scrub both videos"
+        type="range" min="0" max={total} step="0.001" value={playhead ?? 0}
+        onChange={(event) => onSeek(event.target.value)}
+      />}
     </div>
   )
 }
@@ -174,32 +249,112 @@ function UnifiedMatchReview({ job, initialReview, onQueued }) {
   const [selectedId, setSelectedId] = useState(firstMatch?.id || null)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
-  const [comparisonMode, setComparisonMode] = useState('side-by-side')
-  const [overlayOpacity, setOverlayOpacity] = useState(50)
-  const [boundary, setBoundary] = useState('start')
-  const [playheads, setPlayheads] = useState({ low: 0, reference: 0 })
+  const [playheads, setPlayheads] = useState({
+    low: firstMatch?.low_range?.start_frame ?? 0,
+    reference: firstMatch?.reference_range?.start_frame ?? 0,
+  })
+  const [sequenceTime, setSequenceTime] = useState(firstMatch?.sequence_start_seconds || 0)
+  const [playing, setPlaying] = useState(false)
+  const [matchDraft, setMatchDraft] = useState(null)
+  const [draftDirty, setDraftDirty] = useState(false)
+  const lowVideo = useRef(null)
+  const referenceVideo = useRef(null)
+  const sequenceTimeRef = useRef(sequenceTime)
+  const syncedSequenceRef = useRef(null)
+  const playingSpanRef = useRef({ low: null, reference: null })
   const total = Math.max(.001, review.spans.reduce((value, span) => Math.max(value, span.sequence_start_seconds + span.sequence_duration_seconds), 0))
-  const [viewport, setViewport] = useState({ start: 0, end: Math.min(total, 60) })
   const selected = review.spans.find((span) => span.id === selectedId) || review.spans[0]
 
-  const rangeFrame = useCallback((span, stream, edge = 'start') => {
-    const range = span?.[`${stream}_range`]
-    if (!range) return null
-    return edge === 'start' ? range.start_frame : range.end_frame - 1
-  }, [])
+  const sourcePosition = useCallback((time, stream) => {
+    const span = locationAt(review.spans, time, total)
+    if (!span) return null
+    const spanIndex = review.spans.findIndex((item) => item.id === span.id)
+    const range = span[`${stream}_range`]
+    const window = streamWindow(span, spanIndex, stream, review.media)
+    if (!range || !window || time < window.start || time > window.end + .0001) return null
+    const anchorFrame = matchDraft?.[`${stream}In`]
+    if (span.id === selected.id && matchDraft?.inTime != null && anchorFrame != null && time >= matchDraft.inTime) {
+      const frame = anchorFrame + Math.round((time - matchDraft.inTime) * review.media[stream].fps)
+      if (frame >= range.start_frame && frame < range.end_frame) {
+        return { span, range, window, frame, time: frame / review.media[stream].fps }
+      }
+    }
+    const progress = Math.max(0, Math.min(1, (time - window.start) / Math.max(.001, window.end - window.start)))
+    const frame = Math.min(range.end_frame - 1, range.start_frame + Math.round(progress * Math.max(0, range.end_frame - range.start_frame - 1)))
+    return { span, range, window, frame, time: frame / review.media[stream].fps }
+  }, [matchDraft, review.media, review.spans, selected.id, total])
 
   useEffect(() => {
-    if (!selected) return
-    if (selected.kind === 'difference') setComparisonMode('side-by-side')
-    setPlayheads({
-      low: rangeFrame(selected, 'low') ?? 0,
-      reference: rangeFrame(selected, 'reference') ?? 0,
-    })
-    const padding = Math.max(5, selected.sequence_duration_seconds * .4)
-    const start = Math.max(0, selected.sequence_start_seconds - padding)
-    const end = Math.min(total, Math.max(start + 10, selected.sequence_start_seconds + selected.sequence_duration_seconds + padding))
-    setViewport({ start: Math.max(0, end === total ? Math.max(0, total - Math.max(10, end - start)) : start), end })
-  }, [selectedId]) // eslint-disable-line react-hooks/exhaustive-deps
+    sequenceTimeRef.current = sequenceTime
+    const positions = { low: sourcePosition(sequenceTime, 'low'), reference: sourcePosition(sequenceTime, 'reference') }
+    if (syncedSequenceRef.current !== sequenceTime) {
+      syncedSequenceRef.current = sequenceTime
+      setPlayheads((current) => ({
+        low: positions.low?.frame ?? current.low,
+        reference: positions.reference?.frame ?? current.reference,
+      }))
+    }
+    for (const stream of ['low', 'reference']) {
+      const video = stream === 'low' ? lowVideo.current : referenceVideo.current
+      const position = positions[stream]
+      if (!video) continue
+      if (!position) {
+        video.pause()
+        playingSpanRef.current[stream] = null
+        continue
+      }
+      const target = position.time
+      if (!playing || Math.abs(video.currentTime - target) > .15) video.currentTime = target
+      const sourceDuration = (position.range.end_frame - position.range.start_frame) / review.media[stream].fps
+      const timelineDuration = position.window.end - position.window.start
+      video.playbackRate = Math.max(.25, Math.min(4, sourceDuration / Math.max(.001, timelineDuration)))
+      if (playing && playingSpanRef.current[stream] !== position.span.id) {
+        playingSpanRef.current[stream] = position.span.id
+        const attempt = video.play()
+        if (attempt) attempt.catch(() => {
+          setPlaying(false)
+          setError('Playback could not start. Allow video playback in the browser and try again.')
+        })
+      }
+    }
+  }, [playing, review.media, sequenceTime, sourcePosition])
+
+  useEffect(() => {
+    if (!playing) {
+      ;[lowVideo.current, referenceVideo.current].forEach((video) => video?.pause())
+      playingSpanRef.current = { low: null, reference: null }
+      return undefined
+    }
+    let animationFrame
+    let prior = performance.now()
+    function advance(now) {
+      const next = Math.min(total, sequenceTimeRef.current + (now - prior) / 1000)
+      prior = now
+      sequenceTimeRef.current = next
+      setSequenceTime(next)
+      const span = locationAt(review.spans, next, total)
+      if (span) setSelectedId(span.id)
+      if (next >= total) setPlaying(false)
+      else animationFrame = requestAnimationFrame(advance)
+    }
+    animationFrame = requestAnimationFrame(advance)
+    return () => cancelAnimationFrame(animationFrame)
+  }, [playing, review.spans, total])
+
+  useEffect(() => {
+    setMatchDraft(matchDraftForSpan(selected))
+    setDraftDirty(false)
+  }, [review.revision, selected.id]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (!draftDirty) return undefined
+    function beforeUnload(event) {
+      event.preventDefault()
+      event.returnValue = ''
+    }
+    window.addEventListener('beforeunload', beforeUnload)
+    return () => window.removeEventListener('beforeunload', beforeUnload)
+  }, [draftDirty])
 
   async function edit(operation) {
     if (!selected || saving) return null
@@ -242,25 +397,135 @@ function UnifiedMatchReview({ job, initialReview, onQueued }) {
     } finally { setSaving(false) }
   }
 
-  function selectSpan(id) { setSelectedId(id) }
-
-  function seekMatch(progress) {
-    if (!selected) return
-    const next = Math.max(0, Math.min(1, Number(progress)))
-    const frames = {}
-    for (const stream of ['low', 'reference']) {
-      const range = selected[`${stream}_range`]
-      if (range) frames[stream] = Math.round(range.start_frame + next * Math.max(0, range.end_frame - range.start_frame - 1))
-    }
-    setPlayheads((current) => ({ ...current, ...frames }))
+  function seekSequence(time) {
+    const next = Math.max(0, Math.min(total, Number(time)))
+    const span = locationAt(review.spans, next, total)
+    if (span && span.id !== selected.id && draftDirty && !window.confirm('Discard the unsaved Match In/Out changes?')) return
+    syncedSequenceRef.current = null
+    sequenceTimeRef.current = next
+    setSequenceTime(next)
+    if (span) setSelectedId(span.id)
   }
 
-  function stepPlayhead(stream, amount) {
-    const range = selected?.[`${stream}_range`]
+  function selectSpan(id) {
+    const span = review.spans.find((item) => item.id === id)
+    if (id !== selected.id && draftDirty && !window.confirm('Discard the unsaved Match In/Out changes?')) return
+    setSelectedId(id)
+    if (span) {
+      const next = span.sequence_start_seconds + Math.min(.001, span.sequence_duration_seconds / 2)
+      syncedSequenceRef.current = null
+      sequenceTimeRef.current = next
+      setSequenceTime(next)
+    }
+  }
+
+  function togglePlayback() {
+    if (playing) {
+      setPlaying(false)
+      return
+    }
+    if (sequenceTime >= total - .001) seekSequence(0)
+    playingSpanRef.current = { low: null, reference: null }
+    setPlaying(true)
+  }
+
+  function jogPlayhead(stream, nextFrame) {
+    const range = editableRange(stream)
     if (!range) return
-    setPlayheads((current) => ({
-      ...current, [stream]: Math.max(range.start_frame, Math.min(range.end_frame - 1, current[stream] + amount)),
+    setPlaying(false)
+    const frame = Math.max(range.start_frame, Math.min(range.end_frame - 1, Number(nextFrame)))
+    const video = stream === 'low' ? lowVideo.current : referenceVideo.current
+    if (video) video.currentTime = frame / review.media[stream].fps
+    setPlayheads((current) => ({ ...current, [stream]: frame }))
+  }
+
+  function stepPlayhead(stream, amount) { jogPlayhead(stream, playheads[stream] + amount) }
+
+  function markPair(edge) {
+    if (!sourcePosition(sequenceTime, 'low') || !sourcePosition(sequenceTime, 'reference')) {
+      setError('Both videos need footage at the shared playhead before you can mark a pair.')
+      return
+    }
+    setMatchDraft((current) => ({
+      ...current,
+      lowIn: edge === 'in' ? playheads.low : current.lowIn,
+      lowOut: edge === 'out' ? playheads.low : current.lowOut,
+      referenceIn: edge === 'in' ? playheads.reference : current.referenceIn,
+      referenceOut: edge === 'out' ? playheads.reference : current.referenceOut,
+      inTime: edge === 'in' ? sequenceTime : current.inTime,
+      outTime: edge === 'out' ? sequenceTime : current.outTime,
     }))
+    setDraftDirty(true)
+    setError('')
+  }
+
+  function goToMark(edge) {
+    const low = matchDraft?.[`low${edge === 'in' ? 'In' : 'Out'}`]
+    const reference = matchDraft?.[`reference${edge === 'in' ? 'In' : 'Out'}`]
+    const time = matchDraft?.[`${edge}Time`]
+    if (low == null || reference == null || time == null) return
+    seekSequence(time)
+    jogPlayhead('low', low)
+    jogPlayhead('reference', reference)
+  }
+
+  async function snapPlayhead(targetStream) {
+    if (saving) return
+    const fixedStream = targetStream === 'low' ? 'reference' : 'low'
+    setSaving(true)
+    try {
+      const response = await axios.post(`${API}/jobs/${job.id}/match-review/snap`, {
+        fixed_stream: fixedStream,
+        fixed_frame_index: playheads[fixedStream],
+        target_frame_index: playheads[targetStream],
+      })
+      jogPlayhead(targetStream, response.data.frame.frame_index)
+      setError('')
+    } catch (requestError) {
+      setError(requestError.response?.data?.detail || requestError.message)
+    } finally { setSaving(false) }
+  }
+
+  async function applyMatchDraft() {
+    if (!draftValidation.valid || saving) return
+    const operation = selected.kind === 'match' ? 'set_match_range' : 'create_match'
+    const saved = await edit({
+      operation,
+      low_start: matchDraft.lowIn, low_end: matchDraft.lowOut + 1,
+      reference_start: matchDraft.referenceIn, reference_end: matchDraft.referenceOut + 1,
+    })
+    if (!saved) return
+    if (selected.kind === 'difference') {
+      const created = saved.spans.find((span) => span.kind === 'match'
+        && span.low_range.start_frame === matchDraft.lowIn
+        && span.reference_range.start_frame === matchDraft.referenceIn)
+      if (created) setSelectedId(created.id)
+    }
+    setDraftDirty(false)
+  }
+
+  async function saveMatchDraft() {
+    if (!draftDirty || saving) return
+    const saved = await edit({
+      operation: 'set_match_draft',
+      draft: {
+        low_in: matchDraft.lowIn, low_out: matchDraft.lowOut,
+        reference_in: matchDraft.referenceIn, reference_out: matchDraft.referenceOut,
+        in_time: matchDraft.inTime, out_time: matchDraft.outTime,
+      },
+    })
+    if (saved) setDraftDirty(false)
+  }
+
+  async function discardMatchDraft() {
+    if (saving) return
+    if (selected.match_draft) {
+      const saved = await edit({ operation: 'set_match_draft', draft: null })
+      if (!saved) return
+    } else {
+      setMatchDraft(matchDraftForSpan(selected))
+    }
+    setDraftDirty(false)
   }
 
   useEffect(() => {
@@ -276,69 +541,75 @@ function UnifiedMatchReview({ job, initialReview, onQueued }) {
     return () => window.removeEventListener('keydown', keydown)
   })
 
-  function moveBoundary(stream, amount) {
-    if (selected?.kind !== 'match') return
-    const lowRange = selected.low_range
-    const refRange = selected.reference_range
-    const values = {
-      low_frame: boundary === 'start' ? lowRange.start_frame : lowRange.end_frame,
-      reference_frame: boundary === 'start' ? refRange.start_frame : refRange.end_frame,
-    }
-    const key = `${stream}_frame`
-    const ownRange = selected[`${stream}_range`]
-    const min = boundary === 'start' ? 0 : ownRange.start_frame + 1
-    const max = boundary === 'start' ? ownRange.end_frame - 1 : review.media[stream].frame_count
-    values[key] = Math.max(min, Math.min(max, values[key] + amount))
-    edit({ operation: 'move_boundary', boundary, ...values })
-  }
-
-  async function snapBoundary(targetStream) {
-    if (selected?.kind !== 'match' || saving) return
-    const fixedStream = targetStream === 'low' ? 'reference' : 'low'
-    const frameAt = (stream) => boundary === 'start'
-      ? selected[`${stream}_range`].start_frame : selected[`${stream}_range`].end_frame - 1
-    setSaving(true)
-    try {
-      const response = await axios.post(`${API}/jobs/${job.id}/match-review/snap`, {
-        fixed_stream: fixedStream,
-        fixed_frame_index: frameAt(fixedStream),
-        target_frame_index: frameAt(targetStream),
-      })
-      setSaving(false)
-      const values = {
-        low_frame: boundary === 'start' ? selected.low_range.start_frame : selected.low_range.end_frame,
-        reference_frame: boundary === 'start' ? selected.reference_range.start_frame : selected.reference_range.end_frame,
-      }
-      values[`${targetStream}_frame`] = response.data.frame.frame_index + (boundary === 'end' ? 1 : 0)
-      await edit({ operation: 'move_boundary', boundary, ...values })
-    } catch (requestError) {
-      setError(requestError.response?.data?.detail || requestError.message)
-      setSaving(false)
-    }
-  }
-
-  function zoom(factor) {
-    const center = (viewport.start + viewport.end) / 2
-    const duration = Math.max(2, Math.min(total, (viewport.end - viewport.start) * factor))
-    const start = Math.max(0, Math.min(total - duration, center - duration / 2))
-    setViewport({ start, end: start + duration })
-  }
-
-  function pan(factor) {
-    const duration = viewport.end - viewport.start
-    const next = Math.max(0, Math.min(total - duration, viewport.start + duration * factor))
-    setViewport({ start: next, end: next + duration })
-  }
-
   const proposed = review.summary?.proposed_blocks || 0
   const confirmed = review.summary?.confirmed_blocks || 0
-  const progress = selected?.kind === 'match' && selected.low_range.end_frame > selected.low_range.start_frame + 1
-    ? (playheads.low - selected.low_range.start_frame) / (selected.low_range.end_frame - selected.low_range.start_frame - 1) : 0
-  const imageUrl = (stream) => `${API}/jobs/${job.id}/frames/${stream}/${playheads[stream]}`
+  const savedDrafts = review.spans.filter((span) => span.match_draft).length
   const differenceLabel = selected?.kind === 'difference'
     ? selected.low_range && selected.reference_range ? 'Both tracks contain different, unpaired footage here.'
       : selected.low_range ? 'Only the supplemental video has footage here.' : 'Only the reference video has footage here.'
     : null
+
+  function editableRange(stream) {
+    const own = selected?.[`${stream}_range`]
+    if (!own || selected.kind === 'difference') return own
+    const index = review.spans.findIndex((span) => span.id === selected.id)
+    const prior = [...review.spans.slice(0, index)].reverse().find((span) => span.kind === 'match')
+    const following = review.spans.slice(index + 1).find((span) => span.kind === 'match')
+    return {
+      start_frame: prior?.[`${stream}_range`]?.end_frame ?? 0,
+      end_frame: following?.[`${stream}_range`]?.start_frame ?? review.media[stream].frame_count,
+    }
+  }
+
+  const draftComplete = matchDraft && ['lowIn', 'lowOut', 'referenceIn', 'referenceOut']
+    .every((key) => matchDraft[key] != null)
+  let draftMessage = draftComplete ? '' : 'Set both Match In and Match Out frame pairs.'
+  if (draftComplete && (matchDraft.lowIn > matchDraft.lowOut || matchDraft.referenceIn > matchDraft.referenceOut)) {
+    draftMessage = 'Match Out cannot be earlier than Match In in either video.'
+  }
+  const lowDuration = draftComplete ? (matchDraft.lowOut - matchDraft.lowIn + 1) / review.media.low.fps : 0
+  const referenceDuration = draftComplete ? (matchDraft.referenceOut - matchDraft.referenceIn + 1) / review.media.reference.fps : 0
+  const durationTolerance = Math.max(.5 / review.media.low.fps, .5 / review.media.reference.fps) + 1e-6
+  if (!draftMessage && Math.abs(lowDuration - referenceDuration) > durationTolerance) {
+    const frames = Math.round(Math.abs(lowDuration - referenceDuration) * Math.max(review.media.low.fps, review.media.reference.fps))
+    draftMessage = `The segment differs by about ${frames} frame${frames === 1 ? '' : 's'}. Mark Out before the missing footage and start a new segment after it.`
+  }
+  const draftValidation = { complete: Boolean(draftComplete), valid: Boolean(draftComplete && !draftMessage), message: draftMessage }
+  const hasDraftChanges = draftDirty || Boolean(selected?.match_draft)
+  const draftMarks = [
+    matchDraft?.inTime != null ? { edge: 'in', time: matchDraft.inTime } : null,
+    matchDraft?.outTime != null ? { edge: 'out', time: matchDraft.outTime } : null,
+  ].filter(Boolean)
+
+  function timelineFeed(stream) {
+    const position = sourcePosition(sequenceTime, stream)
+    const jogRange = editableRange(stream)
+    if (!position) return <figure className={`timeline-video-feed no-footage ${stream}`} aria-label={`${streamLabel[stream]} playback feed`}>
+      <div className="timeline-video-empty"><b>No footage</b><span>{streamLabel[stream]} has no source video at {formatTime(sequenceTime)}.</span></div>
+      <figcaption><b>{streamLabel[stream]}</b><span>empty at unified playhead</span></figcaption>
+    </figure>
+    return <figure className={`timeline-video-feed ${stream}`} aria-label={`${streamLabel[stream]} playback feed`}>
+      <video
+        ref={stream === 'low' ? lowVideo : referenceVideo}
+        muted playsInline preload="metadata" src={`${ORIGIN}${review.proxy_urls[stream]}`}
+        poster={`${API}/jobs/${job.id}/frames/${stream}/${playheads[stream]}`}
+      ><img className="video-fallback-frame" src={`${API}/jobs/${job.id}/frames/${stream}/${playheads[stream]}`} alt={`${streamLabel[stream]} frame ${playheads[stream]}`} /></video>
+      <figcaption>
+        <b>{streamLabel[stream]}</b>
+        <span>frame {playheads[stream]} · source {formatTime(playheads[stream] / review.media[stream].fps)}</span>
+        <span className="feed-step-controls">
+          {[-10, -1, 1, 10].map((amount) => {
+            const direction = amount < 0 ? 'Earlier' : 'Later'
+            const icon = amount === -10 ? 'earlier10' : amount === -1 ? 'earlier' : amount === 1 ? 'later' : 'later10'
+            const label = `${direction} ${Math.abs(amount)} ${streamLabel[stream]} frame${Math.abs(amount) === 1 ? '' : 's'}`
+            return <TooltipButton key={amount} type="button" className="icon-button" onClick={() => stepPlayhead(stream, amount)} aria-label={label} tooltip={label}><Icon name={icon} /></TooltipButton>
+          })}
+          <TooltipButton type="button" className="icon-button" disabled={saving} onClick={() => snapPlayhead(stream)} aria-label={`Find closest ${streamLabel[stream]} frame`} tooltip="Search nearby frames for the closest visual match."><Icon name="closest" /></TooltipButton>
+        </span>
+        {jogRange && <label className="feed-jog"><span>Independent source jog</span><input aria-label={`Jog ${streamLabel[stream]} frame`} type="range" min={jogRange.start_frame} max={jogRange.end_frame - 1} step="1" value={playheads[stream]} onChange={(event) => jogPlayhead(stream, event.target.value)} /></label>}
+      </figcaption>
+    </figure>
+  }
 
   return <div className="match-review unified-review">
     <div className="review-intro">
@@ -355,78 +626,56 @@ function UnifiedMatchReview({ job, initialReview, onQueued }) {
     <section className="review-stage unified-timeline-stage" aria-labelledby="alignment-map-heading">
       <div className="stage-heading-row">
         <div className="stage-heading"><span>1</span><div><p className="eyebrow">ALIGNMENT MAP</p><h3 id="alignment-map-heading">One sequence, two source tracks</h3></div></div>
-        <button type="button" onClick={reanalyze} disabled={saving}>Rebuild alignment</button>
+        <TooltipButton type="button" className="icon-button" onClick={reanalyze} disabled={saving} aria-label="Rebuild alignment" tooltip="Rebuild the automatic alignment and discard current match decisions."><Icon name="refresh" /></TooltipButton>
       </div>
       <div className="coverage-key"><span><i className="confirmed" />Confirmed match</span><span><i className="proposed" />Proposed match</span><span><i className="difference" />Unpaired difference</span></div>
-      <UnifiedTracks spans={review.spans} total={total} selectedId={selected?.id} onSelect={selectSpan} />
-      <div className="viewport-rail" aria-label="Visible timeline range">
-        <span style={{ left: `${viewport.start / total * 100}%`, width: `${(viewport.end - viewport.start) / total * 100}%` }} />
-        <input aria-label="Timeline viewport position" type="range" min="0" max={Math.max(0, total - (viewport.end - viewport.start))} step="0.1" value={viewport.start} onChange={(event) => {
-          const start = Number(event.target.value)
-          setViewport({ start, end: start + (viewport.end - viewport.start) })
-        }} />
+      {timelineFeed('reference')}
+      <UnifiedTracks spans={review.spans} media={review.media} total={total} selectedId={selected?.id} onSelect={selectSpan} onSeek={seekSequence} playhead={sequenceTime} marks={draftMarks} />
+      <div className="unified-transport">
+        <TooltipButton type="button" className="icon-button" onClick={togglePlayback} aria-label={playing ? 'Pause both timeline videos' : 'Play both timeline videos'} tooltip={playing ? 'Pause both timeline videos.' : 'Play both timeline videos.'}><Icon name={playing ? 'pause' : 'play'} /></TooltipButton>
+        <output>Playhead {formatTime(sequenceTime)} / {formatTime(total)}</output>
       </div>
-      <div className="timeline-controls">
-        <button type="button" onClick={() => pan(-.75)} disabled={viewport.start <= 0}>← Earlier</button>
-        <button type="button" onClick={() => zoom(.5)}>Zoom in</button>
-        <button type="button" onClick={() => zoom(2)} disabled={viewport.end - viewport.start >= total}>Zoom out</button>
-        <button type="button" onClick={() => pan(.75)} disabled={viewport.end >= total}>Later →</button>
-        <span>{formatTime(viewport.start)} – {formatTime(viewport.end)}</span>
-      </div>
-      <UnifiedTracks spans={review.spans} total={total} windowStart={viewport.start} windowEnd={viewport.end} selectedId={selected?.id} onSelect={selectSpan} detail />
+      {(selected?.kind === 'match' || (selected?.low_range && selected?.reference_range)) && <div className="timeline-match-toolbar" role="group" aria-label="Frame match controls">
+        <div className="timeline-mark-pairs">
+          {['in', 'out'].map((edge) => {
+            const title = edge === 'in' ? 'Match In' : 'Match Out'
+            const shortTitle = edge === 'in' ? 'In' : 'Out'
+            const lowFrame = matchDraft?.[`low${edge === 'in' ? 'In' : 'Out'}`]
+            const referenceFrame = matchDraft?.[`reference${edge === 'in' ? 'In' : 'Out'}`]
+            return <div className={`timeline-mark-pair ${edge}`} key={edge}>
+              <span className="timeline-mark-value"><b>{shortTitle}</b>{lowFrame == null ? 'Not set' : `L${lowFrame} ↔ H${referenceFrame}`}</span>
+              <div className="match-mark-actions">
+                <TooltipButton type="button" className="icon-button" disabled={lowFrame == null || referenceFrame == null} onClick={() => goToMark(edge)} aria-label={`Go to ${title}`} tooltip={`Move both feeds to the saved ${title} pair.`}><Icon name="locate" /></TooltipButton>
+                <TooltipButton type="button" className="icon-button primary" disabled={saving} aria-label={`Mark ${title} from playheads`} onClick={() => markPair(edge)} tooltip={`Set ${title} from the two current frames.`}><Icon name={edge === 'in' ? 'markIn' : 'markOut'} /></TooltipButton>
+              </div>
+            </div>
+          })}
+          <div className="timeline-match-actions">
+            {selected.kind === 'match' && <TooltipButton type="button" className="icon-button" disabled={saving} onClick={() => edit({ operation: 'mark_unpaired' })} aria-label="Mark block unpaired" tooltip="Exclude this block from paired training."><Icon name="unpaired" /></TooltipButton>}
+            <TooltipButton type="button" className="icon-button" disabled={saving || (!draftDirty && !selected.match_draft)} onClick={discardMatchDraft} aria-label="Discard frame draft" tooltip="Discard saved and unsaved In/Out changes for this block."><Icon name="discard" /></TooltipButton>
+            <TooltipButton type="button" className="icon-button" disabled={saving || !draftDirty} onClick={saveMatchDraft} aria-label="Save frame draft" tooltip="Save this In/Out work now and resume it later."><Icon name="save" /></TooltipButton>
+            <TooltipButton type="button" className="icon-button primary" disabled={saving || !hasDraftChanges || !draftValidation.valid} onClick={applyMatchDraft} aria-label={selected.kind === 'match' ? 'Apply In / Out' : 'Create proposed match'} tooltip={selected.kind === 'match' ? 'Apply the current In and Out pairs to this match.' : 'Create a proposed match from these frame pairs.'}><Icon name="apply" /></TooltipButton>
+            {selected.kind === 'match' && <TooltipButton type="button" className="icon-button primary" disabled={saving || hasDraftChanges || !draftValidation.valid || selected.status === 'confirmed'} onClick={() => edit({ operation: 'set_status', status: 'confirmed' })} aria-label={selected.status === 'confirmed' ? 'Match confirmed' : 'Confirm match'} tooltip={selected.status === 'confirmed' ? 'This match is confirmed for paired training.' : 'Approve this applied match for paired training.'}><Icon name="confirm" /></TooltipButton>}
+          </div>
+        </div>
+        {draftValidation.message && <p className="match-validation" role="status">{draftValidation.message}</p>}
+        {draftDirty && <p className="unsaved-draft">Unsaved In/Out changes</p>}
+        {!draftDirty && selected.match_draft && <p className="saved-draft">Draft saved · safe to leave and resume later</p>}
+      </div>}
+      {timelineFeed('low')}
       {selected && <p className={`selected-span-label ${selected.kind}`}>
         <b>{selected.kind === 'match' ? `${selected.status} match` : 'unpaired difference'}</b>
         <span>{formatTime(selected.sequence_duration_seconds)}</span>
         {selected.confidence != null && <span>{Math.round(selected.confidence * 100)}% confidence</span>}
       </p>}
-    </section>
-
-    {selected && <section className="review-stage unified-frame-stage" aria-labelledby="frame-inspector-heading">
-      <div className="stage-heading-row">
-        <div className="stage-heading"><span>2</span><div><p className="eyebrow">FRAME INSPECTOR</p><h3 id="frame-inspector-heading">{selected.kind === 'match' ? 'Verify corresponding frames' : 'Inspect unmatched footage'}</h3></div></div>
-        <div className="view-toggle" aria-label="Comparison view">
-          <button type="button" className={comparisonMode === 'side-by-side' ? 'selected' : ''} aria-pressed={comparisonMode === 'side-by-side'} onClick={() => setComparisonMode('side-by-side')}>Side by side</button>
-          <button type="button" disabled={selected.kind !== 'match'} className={comparisonMode === 'overlay' ? 'selected' : ''} aria-pressed={comparisonMode === 'overlay'} onClick={() => setComparisonMode('overlay')}>Overlay</button>
-        </div>
-      </div>
       {differenceLabel && <p className="difference-notice">{differenceLabel}</p>}
-      <div className={`exact-frame-comparison ${comparisonMode}`}>
-        {['low', 'reference'].map((stream) => selected[`${stream}_range`] && <figure className={`exact-frame ${stream}`} key={stream} style={comparisonMode === 'overlay' && stream === 'reference' ? { opacity: overlayOpacity / 100 } : undefined}>
-          <img src={imageUrl(stream)} alt={`${streamLabel[stream]} frame ${playheads[stream]}`} />
-          <figcaption><b>{streamLabel[stream]}</b><span>frame {playheads[stream]} · {formatTime(playheads[stream] / review.media[stream].fps)}</span></figcaption>
-          <div className="step-controls">{[-10, -1, 1, 10].map((amount) => <button key={amount} type="button" onClick={() => stepPlayhead(stream, amount)}>{amount < 0 ? '←' : '→'} {Math.abs(amount)}</button>)}</div>
-        </figure>)}
-      </div>
-      {comparisonMode === 'overlay' && selected.kind === 'match' && <label className="overlay-control"><span>Reference opacity</span><input aria-label="Reference frame opacity" type="range" min="0" max="100" value={overlayOpacity} onChange={(event) => setOverlayOpacity(Number(event.target.value))} /><output>{overlayOpacity}%</output></label>}
-      {selected.kind === 'match' && <label className="dense-frame-scrubber"><span>Matched position</span><input aria-label="Matched frame position" type="range" min="0" max="1000" value={Math.round(progress * 1000)} onChange={(event) => seekMatch(Number(event.target.value) / 1000)} /><output>{Math.round(progress * 100)}%</output></label>}
       <p className="keyboard-help">Keyboard: ←/→ steps the supplemental frame; ↓/↑ steps the reference frame. Hold Shift for ten frames.</p>
-    </section>}
-
-    {selected?.kind === 'match' && <section className="review-stage cut-editor" aria-labelledby="cut-editor-heading">
-      <div className="stage-heading"><span>3</span><div><p className="eyebrow">CUT EDITOR</p><h3 id="cut-editor-heading">Correct boundaries and approve this block</h3></div></div>
-      <div className="boundary-tabs"><button type="button" className={boundary === 'start' ? 'selected' : ''} onClick={() => setBoundary('start')}>Start cut</button><button type="button" className={boundary === 'end' ? 'selected' : ''} onClick={() => setBoundary('end')}>End cut</button></div>
-      <div className="cut-grid">{['low', 'reference'].map((stream) => {
-        const frame = boundary === 'start' ? selected[`${stream}_range`].start_frame : selected[`${stream}_range`].end_frame - 1
-        return <div key={stream}><b>{streamLabel[stream]}</b><span>frame {frame}</span><div className="step-controls">{[-10, -1, 1, 10].map((amount) => <button type="button" key={amount} disabled={saving} onClick={() => moveBoundary(stream, amount)}>{amount < 0 ? '←' : '→'} {Math.abs(amount)}</button>)}</div><button type="button" className="snap" disabled={saving} onClick={() => snapBoundary(stream)}>Find closest {stream === 'low' ? 'supplemental' : 'reference'} frame</button></div>
-      })}</div>
-      <div className="review-actions">
-        <button type="button" disabled={saving} onClick={() => edit({ operation: 'split_match', low_frame: playheads.low, reference_frame: playheads.reference })}>Split at inspected frames</button>
-        <button type="button" disabled={saving} onClick={() => edit({ operation: 'mark_unpaired' })}>Mark block unpaired</button>
-        <button type="button" className="primary" disabled={saving || selected.status === 'confirmed'} onClick={() => edit({ operation: 'set_status', status: 'confirmed' })}>{selected.status === 'confirmed' ? 'Block confirmed' : 'Confirm matched block'}</button>
-      </div>
-    </section>}
-
-    {selected?.kind === 'difference' && selected.low_range && selected.reference_range && <div className="difference-actions">
-      <button type="button" disabled={saving} onClick={() => edit({
-        operation: 'create_match', low_start: selected.low_range.start_frame, low_end: selected.low_range.end_frame,
-        reference_start: selected.reference_range.start_frame, reference_end: selected.reference_range.end_frame,
-      })}>Propose these ranges as a match</button>
-    </div>}
+    </section>
     {error && <p className="alert error" role="alert">{error}</p>}
     <div className="approval-actions">
-      <p>Resolve each proposed match. Difference blocks remain visible but never become training pairs.</p>
-      <button type="button" onClick={() => approve('unpaired')} disabled={saving || proposed > 0}>Train without confirmed pairs</button>
-      <button type="button" className="primary" onClick={() => approve('paired')} disabled={saving || proposed > 0 || confirmed === 0}>Use dense confirmed pairs and start processing</button>
+      <p>Resolve each proposed match and apply or discard saved drafts. Difference blocks remain visible but never become training pairs.</p>
+      <button type="button" onClick={() => approve('unpaired')} disabled={saving || proposed > 0 || savedDrafts > 0 || draftDirty}>Train without confirmed pairs</button>
+      <button type="button" className="primary" onClick={() => approve('paired')} disabled={saving || proposed > 0 || confirmed === 0 || savedDrafts > 0 || draftDirty}>Use dense confirmed pairs and start processing</button>
     </div>
   </div>
 }
@@ -1158,8 +1407,6 @@ function App() {
         {error && <p className="alert error" role="alert">{error}</p>}
       </section>
 
-      <JobList jobs={jobs} selectedId={effectiveSelectedId} onSelect={setSelectedId} onCancelAll={requestCancelAll} />
-
       {job && (
         <section className="panel job" aria-live="polite">
           <div className="job-head">
@@ -1189,6 +1436,8 @@ function App() {
           </div>
         </section>
       )}
+
+      <JobList jobs={jobs} selectedId={effectiveSelectedId} onSelect={setSelectedId} onCancelAll={requestCancelAll} />
       {cancelAllOpen && <CancelJobsDialog activeCount={activeCount} busy={cancellingAll} error={cancelAllError} onClose={() => setCancelAllOpen(false)} onConfirm={cancelAll} />}
     </main>
   )

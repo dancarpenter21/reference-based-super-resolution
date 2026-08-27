@@ -3,10 +3,10 @@ import numpy as np
 import pytest
 
 from ml_engine.alignment import (
-    _add_audio_evidence, align_videos, analyze_alignment, build_dense_pair_manifest,
-    validate_alignment_spans,
+    Anchor, _add_audio_evidence, align_videos, analyze_alignment, build_dense_pair_manifest,
+    refine_anchors, validate_alignment_spans,
 )
-from ml_engine.media import MediaInfo, probe
+from ml_engine.media import MediaInfo, normalize_reference_frame, probe
 
 
 def write_video(path, seed, frames=90, fps=10):
@@ -18,6 +18,37 @@ def write_video(path, seed, frames=90, fps=10):
         cv2.putText(frame, str(index), (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
         writer.write(frame)
     writer.release()
+
+
+def test_refines_coarse_anchors_to_exact_shifted_frames(tmp_path):
+    low, ref = tmp_path / "low-shifted.mp4", tmp_path / "ref-shifted.mp4"
+    rng = np.random.default_rng(91)
+    frames = [rng.integers(0, 255, (120, 160, 3), dtype=np.uint8) for _ in range(12)]
+    prefix = [np.zeros((120, 160, 3), dtype=np.uint8) for _ in range(3)]
+    for path, content in ((low, frames), (ref, prefix + frames)):
+        writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), 10, (160, 120))
+        for frame in content:
+            writer.write(frame)
+        writer.release()
+    low_info, ref_info = probe(low), probe(ref)
+    capture = cv2.VideoCapture(str(low))
+    low_samples = []
+    for index in (2, 7):
+        capture.set(cv2.CAP_PROP_POS_FRAMES, index)
+        ok, frame = capture.read()
+        assert ok
+        low_samples.append((index / low_info.fps, normalize_reference_frame(frame, low_info)))
+    capture.release()
+
+    refined = refine_anchors(
+        ref,
+        [Anchor(.2, .0, .8), Anchor(.7, 1.0, .8)],
+        low_samples,
+        low_info,
+        ref_info,
+    )
+
+    assert [round(anchor.reference_time * ref_info.fps) for anchor in refined] == [5, 10]
 
 
 def test_unrelated_videos_fall_back(tmp_path):
@@ -109,10 +140,21 @@ def test_different_frame_rates_and_intermittent_gap_form_segments(tmp_path):
     differences = [span for span in review["spans"] if span["kind"] == "difference"]
     assert len(matches) >= 2
     assert differences
-    confirmed = [
+    all_confirmed = [
         {**span, "status": "confirmed"} if span["kind"] == "match" else span
         for span in review["spans"]
     ]
+    with pytest.raises(ValueError, match="missing or extra frames"):
+        validate_alignment_spans(all_confirmed, low_info, ref_info)
+
+    # Correct the first automatic draft to an exact-duration pair. The one
+    # reference frame removed from Match Out becomes explicit unpaired footage.
+    confirmed = [{**span} for span in review["spans"]]
+    first_match = next(span for span in confirmed if span["kind"] == "match")
+    first_match["reference_range"] = {**first_match["reference_range"], "end_frame": 32}
+    first_match["status"] = "confirmed"
+    following_difference = confirmed[confirmed.index(first_match) + 1]
+    following_difference["reference_range"] = {"start_frame": 32, "end_frame": 33}
     confirmed = validate_alignment_spans(confirmed, low_info, ref_info)
     manifest = build_dense_pair_manifest(confirmed, low_info, ref_info)
     assert manifest
@@ -120,7 +162,7 @@ def test_different_frame_rates_and_intermittent_gap_form_segments(tmp_path):
     assert all(0 <= pair["reference_frame"] < ref_info.frame_count for pair in manifest)
     expected_low_frames = sum(
         span["low_range"]["end_frame"] - span["low_range"]["start_frame"]
-        for span in confirmed if span["kind"] == "match"
+        for span in confirmed if span["kind"] == "match" and span["status"] == "confirmed"
     )
     assert len(manifest) == expected_low_frames
     assert [pair["low_frame"] for pair in manifest] == sorted({pair["low_frame"] for pair in manifest})

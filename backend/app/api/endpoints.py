@@ -228,10 +228,106 @@ def _apply_v2_edit(review: dict, payload: dict, low_info, ref_info) -> dict:
     if operation == "set_status":
         if selected.get("kind") != "match" or payload.get("status") not in {"proposed", "confirmed"}:
             raise ValueError("Only matched spans can be proposed or confirmed")
+        if payload.get("status") == "confirmed" and selected.get("match_draft"):
+            raise ValueError("Apply or discard the saved frame draft before confirming this match")
         selected["status"] = payload["status"]
+    elif operation == "set_match_draft":
+        if selected.get("kind") != "match" and not (
+            selected.get("kind") == "difference" and selected.get("low_range") and selected.get("reference_range")
+        ):
+            raise ValueError("Frame drafts require footage from both videos")
+        draft = payload.get("draft")
+        if draft is None:
+            selected.pop("match_draft", None)
+        elif not isinstance(draft, dict):
+            raise ValueError("draft must be an object or null")
+        else:
+            saved_draft: dict[str, int | float | None] = {}
+            for edge in ("in", "out"):
+                low_value = draft.get(f"low_{edge}")
+                ref_value = draft.get(f"reference_{edge}")
+                time_value = draft.get(f"{edge}_time")
+                values = (low_value, ref_value, time_value)
+                if all(value is None for value in values):
+                    saved_draft.update({f"low_{edge}": None, f"reference_{edge}": None, f"{edge}_time": None})
+                    continue
+                if any(value is None for value in values):
+                    raise ValueError(f"Saved Match {edge.title()} requires both frames and its timeline position")
+                low_frame, ref_frame = int(low_value), int(ref_value)
+                if not 0 <= low_frame < low_info.frame_count or not 0 <= ref_frame < ref_info.frame_count:
+                    raise ValueError(f"Saved Match {edge.title()} is outside a source video")
+                saved_draft.update({
+                    f"low_{edge}": low_frame, f"reference_{edge}": ref_frame,
+                    f"{edge}_time": float(time_value),
+                })
+            if not any(saved_draft[key] is not None for key in ("low_in", "low_out")):
+                selected.pop("match_draft", None)
+            else:
+                selected["match_draft"] = saved_draft
+                if selected.get("kind") == "match":
+                    selected.update(status="proposed", origin="manual")
+    elif operation == "set_match_range":
+        if selected.get("kind") != "match":
+            raise ValueError("Only a matched span has editable In and Out marks")
+        requested = {
+            "low_range": {
+                "start_frame": int(payload["low_start"]),
+                "end_frame": int(payload["low_end"]),
+            },
+            "reference_range": {
+                "start_frame": int(payload["reference_start"]),
+                "end_frame": int(payload["reference_end"]),
+            },
+        }
+        previous_match = next(
+            (cursor for cursor in range(index - 1, -1, -1) if spans[cursor].get("kind") == "match"),
+            None,
+        )
+        next_match = next(
+            (cursor for cursor in range(index + 1, len(spans)) if spans[cursor].get("kind") == "match"),
+            None,
+        )
+        envelope: dict[str, tuple[int, int]] = {}
+        for stream, info in (("low", low_info), ("reference", ref_info)):
+            start = spans[previous_match][f"{stream}_range"]["end_frame"] if previous_match is not None else 0
+            end = spans[next_match][f"{stream}_range"]["start_frame"] if next_match is not None else info.frame_count
+            value = requested[f"{stream}_range"]
+            if not start <= value["start_frame"] < value["end_frame"] <= end:
+                raise ValueError(f"The {stream} In/Out marks overlap another matched segment")
+            envelope[stream] = (start, end)
+
+        replacements: list[dict] = []
+        before = {
+            f"{stream}_range": (
+                {"start_frame": envelope[stream][0], "end_frame": requested[f"{stream}_range"]["start_frame"]}
+                if envelope[stream][0] < requested[f"{stream}_range"]["start_frame"] else None
+            ) for stream in ("low", "reference")
+        }
+        if before["low_range"] or before["reference_range"]:
+            replacements.append({
+                "id": str(uuid.uuid4()), "kind": "difference", **before,
+                "origin": "manual", "status": None, "confidence": None,
+            })
+        selected.pop("match_draft", None)
+        replacements.append({**selected, **requested, "origin": "manual", "status": "proposed"})
+        after = {
+            f"{stream}_range": (
+                {"start_frame": requested[f"{stream}_range"]["end_frame"], "end_frame": envelope[stream][1]}
+                if requested[f"{stream}_range"]["end_frame"] < envelope[stream][1] else None
+            ) for stream in ("low", "reference")
+        }
+        if after["low_range"] or after["reference_range"]:
+            replacements.append({
+                "id": str(uuid.uuid4()), "kind": "difference", **after,
+                "origin": "manual", "status": None, "confidence": None,
+            })
+        left = 0 if previous_match is None else previous_match + 1
+        right = len(spans) if next_match is None else next_match
+        spans[left:right] = replacements
     elif operation == "mark_unpaired":
         if selected.get("kind") != "match":
             raise ValueError("Only a matched span can be marked unpaired")
+        selected.pop("match_draft", None)
         selected.update(kind="difference", status=None, confidence=None, origin="manual")
         spans = _coalesce_differences(spans)
     elif operation == "move_boundary":
@@ -264,6 +360,7 @@ def _apply_v2_edit(review: dict, payload: dict, low_info, ref_info) -> dict:
                     neighbor[f"{stream}_range"] = None
                 if neighbor.get("kind") == "match":
                     neighbor["status"] = "proposed"
+        selected.pop("match_draft", None)
         selected.update(status="proposed", origin="manual")
         spans = [span for span in spans if span.get("low_range") or span.get("reference_range")]
     elif operation == "split_match":
@@ -273,6 +370,7 @@ def _apply_v2_edit(review: dict, payload: dict, low_info, ref_info) -> dict:
         low, reference = selected["low_range"], selected["reference_range"]
         if not (low["start_frame"] < low_frame < low["end_frame"] and reference["start_frame"] < ref_frame < reference["end_frame"]):
             raise ValueError("Split frames must be inside the matched span")
+        selected.pop("match_draft", None)
         left = {**selected, "id": str(uuid.uuid4()), "status": "proposed", "origin": "manual",
                 "low_range": {"start_frame": low["start_frame"], "end_frame": low_frame},
                 "reference_range": {"start_frame": reference["start_frame"], "end_frame": ref_frame}}
@@ -284,6 +382,7 @@ def _apply_v2_edit(review: dict, payload: dict, low_info, ref_info) -> dict:
         if selected.get("kind") != "match" or index + 1 >= len(spans) or spans[index + 1].get("kind") != "match":
             raise ValueError("Only directly adjacent matched spans can be merged")
         following = spans[index + 1]
+        selected.pop("match_draft", None)
         selected.update(
             id=str(uuid.uuid4()), status="proposed", origin="manual",
             low_range={"start_frame": selected["low_range"]["start_frame"], "end_frame": following["low_range"]["end_frame"]},
@@ -422,6 +521,8 @@ def approve_match_review(job_id: str, payload: dict = Body(...)):
         span.get("kind") == "match" and span.get("status") == "proposed" for span in spans
     ):
         raise HTTPException(status_code=422, detail="Confirm or mark every proposed match as unpaired first")
+    if schema_version == 2 and any(span.get("match_draft") for span in spans):
+        raise HTTPException(status_code=422, detail="Apply or discard every saved frame draft first")
     if schema_version == 1 and any(s.get("status") == "proposed" for s in segments):
         raise HTTPException(status_code=422, detail="Confirm or reject every proposed segment first")
     try:

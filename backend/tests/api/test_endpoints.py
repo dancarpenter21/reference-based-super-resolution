@@ -195,12 +195,81 @@ def test_v2_alignment_edit_validation_and_approval(client, tmp_path, monkeypatch
     assert moved.json()["spans"][0]["low_range"]["end_frame"] == 6
     assert moved.json()["spans"][1]["low_range"]["start_frame"] == 6
 
+    saved_draft = client.patch(f"/api/v1/jobs/{job['id']}/match-review", json={
+        "revision": moved.json()["revision"], "span_id": "shared", "operation": "set_match_draft",
+        "draft": {
+            "low_in": 7, "reference_in": 7, "in_time": .7,
+            "low_out": None, "reference_out": None, "out_time": None,
+        },
+    })
+    assert saved_draft.status_code == 200
+    selected_draft = next(span for span in saved_draft.json()["spans"] if span["id"] == "shared")
+    assert selected_draft["match_draft"]["low_in"] == 7
+    persisted = client.get(f"/api/v1/jobs/{job['id']}/match-review")
+    assert next(span for span in persisted.json()["spans"] if span["id"] == "shared")["match_draft"] == selected_draft["match_draft"]
+
+    cleared_draft = client.patch(f"/api/v1/jobs/{job['id']}/match-review", json={
+        "revision": saved_draft.json()["revision"], "span_id": "shared",
+        "operation": "set_match_draft", "draft": None,
+    })
+    assert cleared_draft.status_code == 200
+    assert "match_draft" not in next(span for span in cleared_draft.json()["spans"] if span["id"] == "shared")
+
+    ranged = client.patch(f"/api/v1/jobs/{job['id']}/match-review", json={
+        "revision": cleared_draft.json()["revision"], "span_id": "shared", "operation": "set_match_range",
+        "low_start": 7, "low_end": 19, "reference_start": 7, "reference_end": 19,
+    })
+    assert ranged.status_code == 200
+    ranged_spans = ranged.json()["spans"]
+    selected = next(span for span in ranged_spans if span["id"] == "shared")
+    assert selected["low_range"] == {"start_frame": 7, "end_frame": 19}
+    assert selected["reference_range"] == {"start_frame": 7, "end_frame": 19}
+    assert selected["origin"] == "manual" and selected["status"] == "proposed"
+    assert ranged_spans[0]["low_range"]["end_frame"] == 7
+    assert ranged_spans[-1]["low_range"]["start_frame"] == 19
+
+    mismatched = client.patch(f"/api/v1/jobs/{job['id']}/match-review", json={
+        "revision": ranged.json()["revision"], "span_id": "shared", "operation": "set_match_range",
+        "low_start": 7, "low_end": 18, "reference_start": 7, "reference_end": 19,
+    })
+    assert mismatched.status_code == 200
+    refused = client.patch(f"/api/v1/jobs/{job['id']}/match-review", json={
+        "revision": mismatched.json()["revision"], "span_id": "shared",
+        "operation": "set_status", "status": "confirmed",
+    })
+    assert refused.status_code == 422
+    assert "missing or extra frames" in refused.json()["detail"]
+
+    repaired = client.patch(f"/api/v1/jobs/{job['id']}/match-review", json={
+        "revision": mismatched.json()["revision"], "span_id": "shared", "operation": "set_match_range",
+        "low_start": 7, "low_end": 18, "reference_start": 7, "reference_end": 18,
+    })
     confirmed = client.patch(f"/api/v1/jobs/{job['id']}/match-review", json={
-        "revision": moved.json()["revision"], "span_id": "shared", "operation": "set_status", "status": "confirmed",
+        "revision": repaired.json()["revision"], "span_id": "shared", "operation": "set_status", "status": "confirmed",
     })
     assert confirmed.status_code == 200
+
+    difference = next(span for span in confirmed.json()["spans"] if span["kind"] == "difference" and span.get("low_range") and span.get("reference_range"))
+    difference_draft = client.patch(f"/api/v1/jobs/{job['id']}/match-review", json={
+        "revision": confirmed.json()["revision"], "span_id": difference["id"], "operation": "set_match_draft",
+        "draft": {
+            "low_in": difference["low_range"]["start_frame"],
+            "reference_in": difference["reference_range"]["start_frame"],
+            "in_time": difference["sequence_start_seconds"],
+            "low_out": None, "reference_out": None, "out_time": None,
+        },
+    })
+    blocked_by_draft = client.post(f"/api/v1/jobs/{job['id']}/match-review/approve", json={
+        "revision": difference_draft.json()["revision"], "mode": "paired",
+    })
+    assert blocked_by_draft.status_code == 422
+    assert "saved frame draft" in blocked_by_draft.json()["detail"]
+    cleared_difference = client.patch(f"/api/v1/jobs/{job['id']}/match-review", json={
+        "revision": difference_draft.json()["revision"], "span_id": difference["id"],
+        "operation": "set_match_draft", "draft": None,
+    })
     approved = client.post(f"/api/v1/jobs/{job['id']}/match-review/approve", json={
-        "revision": confirmed.json()["revision"], "mode": "paired",
+        "revision": cleared_difference.json()["revision"], "mode": "paired",
     })
     assert approved.status_code == 202
     assert jobs.get(job["id"])["phase"] == "processing"
