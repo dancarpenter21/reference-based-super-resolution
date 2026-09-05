@@ -164,7 +164,7 @@ class JobStore:
     def active_counts(self) -> dict[str, int]:
         rows = self.connection().execute(
             "SELECT state, COUNT(*) count FROM jobs "
-            "WHERE state NOT IN ('completed','failed','cancelled','awaiting_match_review') GROUP BY state"
+            "WHERE state NOT IN ('completed','failed','cancelled','awaiting_match_review','awaiting_quality_preview') GROUP BY state"
         ).fetchall()
         queued = sum(row["count"] for row in rows if row["state"] == "queued")
         processing = sum(row["count"] for row in rows if row["state"] != "queued")
@@ -190,14 +190,23 @@ class JobStore:
         return self.get(job_id)
 
     def save_review(self, job_id: str, review: dict, expected_revision: int | None = None) -> dict:
-        job = self.get(job_id)
-        if job["state"] != "awaiting_match_review":
-            raise RuntimeError("Frame matches can only be edited while review is awaiting input")
-        if expected_revision is not None and expected_revision != job["review_revision"]:
-            raise RuntimeError("Frame-match review changed; reload before saving")
-        revision = job["review_revision"] + 1
-        review = {**review, "revision": revision}
-        return self.update(job_id, review_data=review, review_revision=revision)
+        db = self.connection()
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            job = self.get(job_id)
+            if job["state"] != "awaiting_match_review":
+                raise RuntimeError("Frame matches can only be edited while review is awaiting input")
+            if expected_revision is not None and expected_revision != job["review_revision"]:
+                raise RuntimeError("Frame-match review changed; reload before saving")
+            revision = job["review_revision"] + 1
+            review = {**review, "revision": revision}
+            db.execute("UPDATE jobs SET review_data=?,review_revision=?,updated_at=? WHERE id=?",
+                       (json.dumps(review),revision,now(),job_id))
+            db.commit()
+            return self.get(job_id)
+        except BaseException:
+            db.rollback()
+            raise
 
     def approve_review(self, job_id: str, mode: str, expected_revision: int) -> dict:
         job = self.get(job_id)
@@ -228,7 +237,7 @@ class JobStore:
         job = self.get(job_id)
         if job["state"] in TERMINAL_STATES:
             return job
-        if job["state"] in {"queued", "awaiting_match_review"}:
+        if job["state"] in {"queued", "awaiting_match_review", "awaiting_quality_preview"}:
             return self.update(job_id, state="cancelled", stage="cancelled", message="Job cancelled", progress=job["progress"])
         return self.update(job_id, cancel_requested=1, message="Cancellation requested")
 
@@ -236,14 +245,14 @@ class JobStore:
         db = self.connection()
         timestamp = now()
         with db:
-            queued = db.execute("SELECT id FROM jobs WHERE state IN ('queued','awaiting_match_review')").fetchall()
+            queued = db.execute("SELECT id FROM jobs WHERE state IN ('queued','awaiting_match_review','awaiting_quality_preview')").fetchall()
             running = db.execute(
                 "SELECT id FROM jobs WHERE state NOT IN ('queued','awaiting_match_review','completed','failed','cancelled') "
                 "AND cancel_requested=0"
             ).fetchall()
             db.execute(
                 "UPDATE jobs SET state='cancelled', stage='cancelled', message='Job cancelled', "
-                "updated_at=? WHERE state IN ('queued','awaiting_match_review')",
+                "updated_at=? WHERE state IN ('queued','awaiting_match_review','awaiting_quality_preview')",
                 (timestamp,),
             )
             db.execute(

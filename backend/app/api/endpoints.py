@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 import uuid
 from copy import deepcopy
@@ -8,7 +9,7 @@ from pathlib import Path
 from typing import Annotated
 
 import cv2
-from fastapi import APIRouter, Body, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Body, File, Form, HTTPException, UploadFile, Query
 from fastapi.responses import FileResponse, Response
 
 from app.services.job_store import store
@@ -50,8 +51,12 @@ def public_job(job: dict) -> dict:
     review = job.get("review_data") or {}
     value["match_summary"] = review.get("summary")
     value["output_geometry"] = review.get("output_geometry")
+    value["source_names"] = job.get("review_data", {}).get("source_names", {}) if job.get("review_data") else {}
+    value["schema_version"] = review.get("schema_version", 1)
     value["eta_seconds"] = None
-    if 0 < job["progress"] < 1 and job["state"] not in {"failed", "cancelled", "awaiting_match_review"}:
+    if review.get("schema_version") == 3:
+        value["eta_seconds"] = (job.get("metrics") or {}).get("eta_seconds")
+    elif 0 < job["progress"] < 1 and job["state"] not in {"failed", "cancelled", "awaiting_match_review"}:
         elapsed = (datetime.now(UTC) - datetime.fromisoformat(job["created_at"])).total_seconds()
         value["eta_seconds"] = round(elapsed * (1 - job["progress"]) / job["progress"])
     if job["state"] == "completed":
@@ -88,6 +93,7 @@ async def create_job(
     try:
         await save_upload(low_video, low_path)
         await save_upload(reference_video, reference_path)
+        (job_dir / "source-names.json").write_text(json.dumps({"low": low_video.filename, "reference": reference_video.filename}))
         job = store.create(
             str(low_path), str(reference_path), str(job_dir), preset, matching_mode=matching_mode,
             use_audio_matching=use_audio_matching, output_resolution=output_resolution,
@@ -147,7 +153,19 @@ def review_job(job_id: str) -> dict:
 
 
 def public_review(job_id: str, review: dict, revision: int) -> dict:
-    value = {**review, "revision": revision}
+    value = {k: v for k, v in review.items() if k != "history"}
+    value["revision"] = revision
+    value["can_undo"] = bool(review.get("history"))
+    if review.get("schema_version") == 3:
+        from ml_engine.review_v3 import indexes, edit_manifest
+        job = store.get(job_id)
+        idx = indexes(job["job_dir"])
+        value["locks"] = [{**p, "low": idx["low"].frame(p["low_frame"]), "reference": idx["reference"].frame(p["reference_frame"])} for p in review["locks"]]
+        value["storyboard"] = edit_manifest(review, idx, allow_proposed=True)
+        value["output_duration_seconds"] = sum(c["output_duration_seconds"] for c in value["storyboard"])
+        value["summary"] = {"proposed_blocks":sum(r["status"]=="proposed" for r in review["ranges"]),"confirmed_blocks":sum(r["status"]=="approved" for r in review["ranges"])}
+        value["ranges"] = [{k:v for k,v in r.items() if k != "pairs_file"} | {"inspected":bool(r.get("pairs_file"))} for r in review["ranges"]]
+
     value["proxy_urls"] = {
         "low": f"/api/v1/jobs/{job_id}/navigation/low",
         "reference": f"/api/v1/jobs/{job_id}/navigation/reference",
@@ -504,6 +522,18 @@ def _apply_v2_edit(review: dict, payload: dict, low_info, ref_info) -> dict:
 def edit_match_review(job_id: str, payload: dict = Body(...)):
     job = review_job(job_id)
     review = job["review_data"]
+    if review.get("schema_version") == 3:
+        from ml_engine.review_v3 import edit_review
+        try:
+            if int(payload.get("revision", -1)) != job["review_revision"]:
+                raise RuntimeError("Review changed; reload before saving")
+            updated = edit_review(review, payload, job["job_dir"])
+            saved = store.save_review(job_id, updated, int(payload.get("revision", -1)))
+        except (KeyError, TypeError, ValueError) as error:
+            raise HTTPException(status_code=422, detail=str(error))
+        except RuntimeError as error:
+            raise HTTPException(status_code=409, detail=str(error))
+        return public_review(job_id, saved["review_data"], saved["review_revision"])
     if int(review.get("schema_version", 1)) != 2:
         raise HTTPException(status_code=409, detail="This review uses the legacy segment editor")
     low_info, ref_info = probe(job["low_path"]), probe(job["reference_path"])
@@ -596,6 +626,17 @@ def approve_match_review(job_id: str, payload: dict = Body(...)):
         raise HTTPException(status_code=422, detail="mode must be paired or unpaired")
     review = job["review_data"]
     schema_version = int(review.get("schema_version", 1))
+    if schema_version == 3:
+        from ml_engine.review_v3 import edit_manifest, indexes
+        try:
+            edit_manifest(review, indexes(job["job_dir"]))
+            updated = store.approve_review(job_id, mode, int(payload.get("revision", -1)))
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error))
+        except RuntimeError as error:
+            raise HTTPException(status_code=409, detail=str(error))
+        worker.notify()
+        return public_job(updated)
     segments = review.get("segments", [])
     spans = review.get("spans", [])
     if schema_version == 2 and any(
@@ -627,10 +668,27 @@ def approve_match_review(job_id: str, payload: dict = Body(...)):
 
 
 @router.get("/jobs/{job_id}/frames/{stream}/{frame_index}")
-def exact_frame(job_id: str, stream: str, frame_index: int):
+def exact_frame(job_id: str, stream: str, frame_index: int, width: int = Query(default=0, ge=0, le=1920)):
     job = review_job(job_id)
     if stream not in {"low", "reference"}:
         raise HTTPException(status_code=404, detail="Unknown video stream")
+    if job["review_data"].get("schema_version") == 3:
+        from ml_engine.indexed_media import FrameIndex, FrameReader, picture
+        index = FrameIndex(Path(job["job_dir"]) / "indexes" / stream)
+        try:
+            metadata = index.frame(frame_index)
+            with FrameReader(index) as reader:
+                frame = picture(reader.read(frame_index), index, job["review_data"].get("geometry", {}).get("crops", {}).get(stream))
+            if width and frame.shape[1] > width:
+                frame = cv2.resize(frame, (width, max(1, round(frame.shape[0]*width/frame.shape[1]))), interpolation=cv2.INTER_AREA)
+            ok, encoded = cv2.imencode(".png", frame)
+            if not ok: raise ValueError("Could not encode frame")
+        except ValueError as error:
+            raise HTTPException(status_code=416, detail=str(error))
+        return Response(encoded.tobytes(), media_type="image/png", headers={
+            "X-Frame-Index":str(frame_index), "X-Frame-PTS":str(metadata["pts"]),
+            "X-Frame-Time":str(metadata["time_seconds"]), "X-Source-Id":index.meta["source_id"],
+            "Cache-Control":"private, max-age=3600"})
     path = job["low_path"] if stream == "low" else job["reference_path"]
     info = probe(path)
     if frame_index < 0 or frame_index >= info.frame_count:
@@ -697,3 +755,59 @@ def delete_job(job_id: str):
     except RuntimeError as error:
         raise HTTPException(status_code=409, detail=str(error))
     shutil.rmtree(job["job_dir"], ignore_errors=True)
+
+
+@router.get("/jobs/{job_id}/frame-index/{stream}")
+def frame_index_page(job_id: str, stream: str, start: int = Query(default=0, ge=0), limit: int = Query(default=25, ge=1, le=200)):
+    job = review_job(job_id)
+    if stream not in {"low", "reference"} or job["review_data"].get("schema_version") != 3:
+        raise HTTPException(status_code=404, detail="Indexed source not found")
+    from ml_engine.indexed_media import FrameIndex
+    index = FrameIndex(Path(job["job_dir"]) / "indexes" / stream)
+    return {"total":len(index), "frames":[index.frame(i) for i in range(start, min(len(index), start+limit))]}
+
+
+@router.get("/jobs/{job_id}/correspondences/{range_id}")
+def correspondence_page(job_id: str, range_id: str, start: int = Query(default=0, ge=0), limit: int = Query(default=100, ge=1, le=200), issues: bool = False):
+    job = review_job(job_id)
+    from ml_engine.review_v3 import read_pairs
+    r = next((r for r in job["review_data"].get("ranges", []) if r["id"] == range_id), None)
+    if r is None: raise HTTPException(status_code=404, detail="Range not found")
+    rows = read_pairs(job["job_dir"], r)
+    if issues: rows = [p for p in rows if not p["eligible"]]
+    return {"total":len(rows), "pairs":rows[start:start+limit], "revision":job["review_revision"]}
+
+
+@router.get("/jobs/{job_id}/quality-preview")
+def quality_preview(job_id: str):
+    job = review_job(job_id)
+    path = Path(job["job_dir"]) / "preparation-v3.json"
+    if not path.exists(): raise HTTPException(status_code=409, detail="Quality preview is not ready")
+    data = json.loads(path.read_text())
+    data.pop("checkpoints", None)
+    data["previews"] = {key:f"/api/v1/jobs/{job_id}/quality-preview/{key}" for key in data["previews"]}
+    return data
+
+
+@router.get("/jobs/{job_id}/quality-preview/{method}")
+def quality_preview_video(job_id: str, method: str):
+    if method not in {"lanczos", "pretrained", "adapted", "selected"}:
+        raise HTTPException(status_code=404, detail="Preview not found")
+    return artifact(job_id, f"preview-{method}.mp4", "video/mp4")
+
+
+@router.post("/jobs/{job_id}/render", status_code=202)
+def start_render(job_id: str, payload: dict = Body(...)):
+    job = review_job(job_id)
+    method = payload.get("method", "selected")
+    path = Path(job["job_dir"]) / "preparation-v3.json"
+    if job["state"] != "awaiting_quality_preview" or not path.exists():
+        raise HTTPException(status_code=409, detail="Review the quality preview before exporting")
+    data = json.loads(path.read_text())
+    if payload.get("revision") != job["review_revision"] or data["revision"] != job["review_revision"]:
+        raise HTTPException(status_code=409, detail="Review changed; rebuild preview")
+    if method not in data["previews"]:
+        raise HTTPException(status_code=422, detail="Choose an available preview method")
+    updated = store.update(job_id, state="queued", stage="queued", phase="render", review_data={**job["review_data"], "render_method":method}, message="Queued for full export", metrics=None)
+    worker.notify()
+    return public_job(updated)

@@ -4,7 +4,8 @@ import logging
 import threading
 from datetime import UTC, datetime
 
-from ml_engine.pipeline import Cancelled, analyze_pipeline, process_pipeline
+from ml_engine.pipeline import Cancelled, process_pipeline
+from ml_engine.workflow_v3 import analyze as analyze_pipeline
 
 from .job_store import JobStore, store
 
@@ -118,6 +119,15 @@ class JobWorker:
                 )
                 return
             current = self.jobs.get(job_id)
+            if current.get("review_data", {}).get("schema_version") == 3:
+                from ml_engine.workflow_v3 import process
+                export = phase == "render"
+                process(current, update, cancelled, export=export)
+                if export:
+                    self.jobs.update(job_id, state="completed", stage="completed", progress=1., message="Combined restored video is ready")
+                else:
+                    self.jobs.update(job_id, state="awaiting_quality_preview", stage="awaiting_quality_preview", phase="preview", progress=.5, message="Compare quality, then export the complete edit")
+                return
             process_pipeline(
                 job["low_path"], job["reference_path"], job["job_dir"], job["preset"],
                 current["review_data"] or {},

@@ -54,7 +54,7 @@ describe('App', () => {
     expect(await screen.findByText(/No jobs yet/)).toBeInTheDocument()
   })
 
-  it('restores jobs, selects the active job, and disables submission', async () => {
+  it('restores jobs and permits another job to be queued', async () => {
     mockGets([activeJob, completedJob], {
       ...systemStatus,
       worker: { ...systemStatus.worker, state: 'busy', current_job_id: activeJob.id },
@@ -68,7 +68,7 @@ describe('App', () => {
     const currentPanel = screen.getByText('step 40 · 2 min remaining').closest('section')
     const jobsPanel = screen.getByRole('region', { name: 'Jobs' })
     expect(currentPanel.compareDocumentPosition(jobsPanel) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
-    expect(screen.getByRole('button', { name: /work already queued or processing/i })).toBeDisabled()
+    expect(screen.getByRole('button', { name: /analyze frames/i })).toBeEnabled()
     expect(screen.getByText('Processing job active-j')).toBeInTheDocument()
     expect(screen.getByText('AMD Radeon RX 9070 XT')).toBeInTheDocument()
     expect(window.localStorage.getItem('refsr-selected-job')).toBe(activeJob.id)

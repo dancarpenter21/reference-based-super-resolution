@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import axios from 'axios'
 import './App.css'
+import FrameWorkspace from './FrameWorkspace'
+import QualityPreview from './QualityPreview'
 
 const API = import.meta.env.VITE_API_URL || 'http://localhost:8000/api/v1'
 const terminal = new Set(['completed', 'failed', 'cancelled'])
@@ -1036,6 +1038,7 @@ function MatchReview({ job, onQueued }) {
   }
 
   if (!review) return <p className="message">Loading frame-match workspace…</p>
+  if (review.schema_version === 3) return <FrameWorkspace api={API} job={job} initialReview={review} onQueued={onQueued} />
   if (review.schema_version === 2) return <UnifiedMatchReview job={job} initialReview={review} onQueued={onQueued} />
   const unresolved = review.segments.filter((item) => item.status === 'proposed').length
   const confirmed = review.segments.filter((item) => item.status === 'confirmed').length
@@ -1256,6 +1259,7 @@ function App() {
   const [jobsLoaded, setJobsLoaded] = useState(false)
   const [selectedId, setSelectedId] = useState(() => window.localStorage.getItem(selectedJobKey))
   const [uploadProgress, setUploadProgress] = useState(0)
+  const [uploading, setUploading] = useState(false)
   const [error, setError] = useState('')
   const [jobsError, setJobsError] = useState('')
   const [system, setSystem] = useState(null)
@@ -1310,7 +1314,7 @@ function App() {
   }, [effectiveSelectedId, jobsLoaded])
 
   const job = useMemo(() => jobs.find((item) => item.id === effectiveSelectedId) || null, [effectiveSelectedId, jobs])
-  const busy = jobs.some((item) => !terminal.has(item.state) && item.state !== 'awaiting_match_review')
+  const busy = uploading
   const activeCount = jobs.filter((item) => !terminal.has(item.state)).length
   const progress = Math.round((job?.progress || 0) * 100)
   const eta = job?.eta_seconds ? `${Math.max(1, Math.round(job.eta_seconds / 60))} min remaining` : null
@@ -1321,6 +1325,8 @@ function App() {
       setError('Select both the low-resolution supplement and the high-resolution reference.')
       return
     }
+    if (uploading) return
+    setUploading(true)
     setError('')
     setUploadProgress(0)
     const data = new FormData()
@@ -1339,7 +1345,7 @@ function App() {
       setUploadProgress(0)
     } catch (requestError) {
       setError(requestError.response?.data?.detail || requestError.message)
-    }
+    } finally { setUploading(false); setUploadProgress(0) }
   }
 
   async function cancel() {
@@ -1403,6 +1409,7 @@ function App() {
         <p className="lede">Train a video-specific upscaler from two overlapping versions of the same video: a high-resolution reference and a low-resolution supplement. Either video may contain footage the other does not.</p>
       </header>
 
+      <ol className="workflow-steps" aria-label="Restoration workflow">{['Sources', 'Frame matching', 'Quality preview', 'Export'].map((label, i) => <li key={label} aria-current={(job?.state === 'awaiting_match_review' ? 1 : job?.state === 'awaiting_quality_preview' ? 2 : job?.state === 'completed' ? 3 : 0) === i ? 'step' : undefined}>{i + 1} · {label}</li>)}</ol>
       <SystemStatus status={system} online={backendOnline} onRecheck={recheckGpu} />
 
       <section className="panel">
@@ -1448,7 +1455,7 @@ function App() {
                 <option value="2160p">2160p · up to 4K</option>
               </select>
             </label>
-            <button className="primary" disabled={busy} type="submit">{busy ? 'Work already queued or processing' : 'Analyze frames'}</button>
+            <button className="primary" disabled={busy} type="submit">{busy ? 'Uploading sources…' : 'Analyze frames'}</button>
           </div>
         </form>
         {uploadProgress > 0 && <p className="upload">Uploading · {uploadProgress}%</p>}
@@ -1470,6 +1477,8 @@ function App() {
           {job.error && <p className="alert error">{job.error}</p>}
           {job.metrics?.psnr && <div className="metrics"><span>Validation PSNR</span><b>{job.metrics.psnr.toFixed(2)} dB</b></div>}
           {job.state === 'awaiting_match_review' && <MatchReview job={job} onQueued={reviewQueued} />}
+          {job.state === 'awaiting_quality_preview' && <QualityPreview api={API} job={job} onQueued={reviewQueued} />}
+          {job.state === 'completed' && job.schema_version === 3 && <QualityPreview api={API} job={job} onQueued={reviewQueued} />}
           {job.state === 'completed' && (
             <div className="result">
               <video controls src={`${API.replace('/api/v1', '')}${job.result_url}`} />
